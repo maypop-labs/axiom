@@ -1,0 +1,14 @@
+# AXIOM MCP server dependencies
+#
+# Most of these are already installed by Python/requirements.txt for the
+# Stage 03 chunk-and-embed script (sentence-transformers, numpy, torch).
+# The only net-new package for the MCP layer is `mcp` itself.
+#
+# Install into the shared Python/venv:
+#     E:\bin\axiom\Python\venv\Scripts\activate.bat
+#     pip install -r E:\bin\axiom\mcp\requirements.txt
+
+mcp>=1.0.0
+sentence-transformers
+numpy
+torch

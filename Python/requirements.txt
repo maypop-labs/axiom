@@ -1,0 +1,34 @@
+# AXIOM Project - Python Dependencies
+# Literature Ingestion Pipeline Requirements
+
+# =============================================================================
+# GPU Acceleration (PyTorch + CUDA)
+# =============================================================================
+# PyTorch with CUDA requires installation from a special index URL.
+# It cannot be installed directly from this requirements file.
+#
+# For RTX 2080 Ti (or other CUDA-capable GPU), run this BEFORE pip install -r:
+#
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+#
+# To verify GPU is available:
+#   python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+#
+# For CPU-only (slower, but works everywhere):
+#   pip install torch torchvision torchaudio
+# =============================================================================
+
+# PDF to Markdown conversion
+# Requires Python 3.10+. Auto-detects CUDA / MPS / CPU via PyTorch (installed
+# above). First run will download Surya model weights (~1GB) to a local cache.
+marker-pdf>=1.10.2
+
+# PDF metadata (page count for the Stage 02 book / paper classifier)
+pypdf>=4.0.0
+
+# Embeddings (paragraph-level semantic search over corpus)
+# Default model: BAAI/bge-base-en-v1.5 (~440MB, 768-dim, downloaded on first use)
+sentence-transformers>=2.7.0
+
+# Excel export (utils/export_pubtator_entities.py)
+openpyxl>=3.1.0
