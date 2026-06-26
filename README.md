@@ -72,4 +72,4 @@ AXIOM is in active single-user development. As of mid-2026 the corpus holds on t
 
 AXIOM is developed by Maypop Labs.
 
-The corpus consists of third-party copyrighted publications and is not redistributed. DrugBank-derived content is used under an academic license; public graph exports redact DrugBank narrative and relational content. A license for the code in this repository is still to be determined.
+The corpus consists of third-party copyrighted publications and is not redistributed. DrugBank-derived content is used under an academic license; public graph exports redact DrugBank narrative and relational content. The code in this repository is released under the MIT License; see `LICENSE`.
