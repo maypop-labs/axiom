@@ -13,6 +13,9 @@
 /Python/export/
 /Python/export_public/
 
+# Website publish launcher, kept local by request
+/run_publish_website.bat
+
 # ----------------------------------------------------------------------------
 # Databases
 # ----------------------------------------------------------------------------
