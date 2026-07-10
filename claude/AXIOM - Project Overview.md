@@ -1,4 +1,4 @@
-# Project AXIOM (V14)
+# Project AXIOM (V16)
 
 A curated biomedical literature corpus plus a curated mechanistic knowledge graph, accessed by Claude through local MCP servers. Single user, single machine, single corpus, single graph. The user (Neil) hand-selects sources; Claude retrieves and reasons over them; proposed graph additions go through explicit user review before commit. The asset is the curation, not the tooling.
 
@@ -162,7 +162,7 @@ Always preserve every `chunk_id` from rewritten entries. Always show before / af
 
 ### `axiom_graph.db` (curated graph)
 
-* `nodes`: `canonical_name` UNIQUE with `node_type`. Node types are open-ended (suggested: `gene`, `protein`, `miRNA`, `PTM_state`, `complex`, `process`, `phenotype`, `compartment`, `condition`, `small_molecule`, `other`). `cross_references` is a TEXT JSON column.
+* `nodes`: `canonical_name` UNIQUE with `node_type`. Node types are open-ended (suggested: `gene`, `protein`, `miRNA`, `PTM_state`, `complex`, `process`, `phenotype`, `compartment`, `condition`, `small_molecule`, `other`). `cross_references` is a TEXT JSON column. Species is not stored: for gene and protein nodes it is derived at read time from `cross_references` (via `mcp/species.py`) and surfaced through `graph_find_nodes_by_species` and the `graph_stats` species histogram.
 * `node_aliases`: alternate names, UNIQUE per node.
 * `node_observations`: per-node corpus-derived findings. One row per supporting chunk. Provenance fields immutable post-creation; only `observation` and `notes` editable. Carries `grounding_type` (one of `corpus_primary`, `corpus_inline_cited`, `lexicon`, `common_knowledge`, `background_weak`) and `provenance_extra` (TEXT JSON) for non-corpus provenance.
 * `edges`: subject -> object directed multigraph keyed by `edge_type`. UNIQUE on `(subject_id, object_id, edge_type)`.
@@ -182,11 +182,11 @@ Detailed column lists live in `lib/axiom_db.py`, `lib/axiom_graph_db.py`, and `E
 
 ## AXIOM MCP server
 
-31 tools across 7 corpus + 24 graph categories.
+33 tools across 7 corpus + 26 graph categories.
 
 **Corpus tools:** `semantic_search`, `keyword_search`, `hybrid_search` (RRF, default search), `get_source`, `get_source_chunks`, `get_chunk`, `find_entity`. All search tools accept `source_type`, `year_min`, `year_max`, `exclude_references` (default `True`). Results include `content`, `source filename / title / year / section`, rank, score, and pre-formatted APA citation, so Claude can cite without follow-up calls.
 
-**Graph reads:** `graph_get_node`, `graph_find_nodes`, `graph_get_edges`, `graph_get_edge`, `graph_neighbors`, `graph_get_observations`. Every node read returns `observation_count`; `graph_get_node` also returns full observations. Cross-DB citation enrichment happens in the MCP layer at read time (not SQL): evidence and observation rows store only `chunk_id`, and APA / DOI / PMID / title / year are inlined when retrieved.
+**Graph reads:** `graph_get_node`, `graph_find_nodes`, `graph_find_nodes_batch`, `graph_find_nodes_by_species`, `graph_get_edges`, `graph_get_edge`, `graph_neighbors`, `graph_get_observations`. Every node read returns `observation_count`; `graph_get_node` also returns full observations. `graph_find_nodes_batch` resolves many name lookups in one call, closing the former per-paper pre-flight bottleneck. `graph_find_nodes_by_species` lists gene and protein nodes by species; species is derived at read time from `cross_references` via `mcp/species.py` and is never stored (pass `unknown` to audit nodes that will export unclassified). Cross-DB citation enrichment happens in the MCP layer at read time (not SQL): evidence and observation rows store only `chunk_id`, and APA / DOI / PMID / title / year are inlined when retrieved.
 
 **Graph writes (per-call):** `graph_add_node` (with optional aliases and cross_references in same call), `graph_add_alias`, `graph_add_edge` (with conditions and evidence in same call), `graph_add_evidence`, `graph_add_condition`, `graph_add_observation`, `graph_update_node`, `graph_update_edge`, `graph_update_observation`, `graph_set_cross_references`.
 
@@ -200,13 +200,13 @@ To enable atomic batches, the 10 low-level write methods in `axiom_graph_db.py` 
 
 **Deletes:** `graph_delete_node` (cascades to incident edges and observations), `graph_delete_edge` (cascades to conditions and evidence), `graph_delete_alias`, `graph_delete_evidence`, `graph_delete_condition`, `graph_delete_observation`.
 
-**Stats:** `graph_stats` (counts, type histograms, top-cited papers, top-observed nodes).
+**Stats:** `graph_stats` (counts, type histograms, a derived species histogram over gene and protein nodes, top-cited papers, top-observed nodes).
 
 Performance: warm startup ~3-4 seconds (model + embedding cache load); resident memory ~239 MB embedding matrix + ~440 MB model on RTX 2080 Ti; per-query latency ~30-200 ms depending on mode.
 
 ## LEXICON MCP server
 
-9 tools, project-agnostic. All `lookup_*` tools return the same envelope: `found`, `query`, `canonical_name`, `suggested_node_type`, `aliases`, `summary`, `notes_prefix`, `cross_references`, `raw`, `_provenance`. Source-specific extras (UniProt PTMs and subcellular; PubChem formula/InChIKey; QuickGO aspect; DrugBank targets, MoA, indication, ATC, groups) populated where available.
+11 tools, project-agnostic. All `lookup_*` tools return the same envelope: `found`, `query`, `canonical_name`, `suggested_node_type`, `aliases`, `summary`, `notes_prefix`, `cross_references`, `raw`, `_provenance`. Source-specific extras (UniProt PTMs and subcellular; PubChem formula/InChIKey; QuickGO aspect; DrugBank targets, MoA, indication, ATC, groups) populated where available.
 
 | Tool | Source | Best for |
 |---|---|---|
@@ -216,6 +216,8 @@ Performance: warm startup ~3-4 seconds (model + embedding cache load); resident 
 | `lexicon_lookup_compound` | PubChem | Small molecules not in DrugBank |
 | `lexicon_lookup_drug` | DrugBank (local SQLite) | Clinical drugs; targets, MoA, indication |
 | `lexicon_find_drugs_by_target` | DrugBank (local SQLite) | Reverse-direction lookup: drugs targeting a given gene/UniProt |
+| `lexicon_find_drugs_by_targets` | DrugBank (local SQLite) | Batched reverse lookup over many targets in one call |
+| `lexicon_lookup_batch` | multiple | Batched `lookup_*` in one call (per-query hint: gene/protein/drug/compound/go_term) |
 | `lexicon_lookup_go_term` | QuickGO | Process and compartment nodes |
 | `lexicon_cache_stats` | local | HTTP cache observability |
 | `lexicon_cache_clear` | local | HTTP cache reset (per-source or all) |
@@ -228,27 +230,76 @@ DrugBank specifics: served from local SQLite at `E:/bin/mcp/lexicon/data/drugban
 
 `lexicon_find_drugs_by_target` accepts gene symbol or UniProt accession (case-insensitive on both `drug_targets.gene_name` and `drug_targets.uniprot_id`); filters AND-combine on `organism_id` (default 9606 -> "Humans"; 0 disables; map covers 9606 / 10090 / 10116), `target_kind`, `action`, `groups`, `exclude_withdrawn` (default `True`). Action and groups filters apply in Python over parsed JSON lists; SQL handles only organism + target_kind. Results sort approved-first, then target_kind primacy (target -> enzyme -> transporter -> carrier), then alphabetical. The empty result for a TF target is itself meaningful and typically lands as a `node_observation` rather than a tool retry.
 
+## Network control analyses
+
+A read-only analysis layer over `axiom_graph.db` that mines the curated graph for actionable intervention targets using network control theory. It is separate from the extraction pipeline: it consumes the graph, never modifies it, and writes TSV artifacts plus a JSON build report into `Python/export/`. Everything runs from the AXIOM venv (adds `networkx` and `scipy`, both already resident; the reporting pass adds only standard-library `urllib`).
+
+As of V16 the layer is multi-outcome. Where it previously routed everything to two organismal endpoints (organismal aging and maximum lifespan), it now targets the full curated outcome panel: those two anchors plus the twelve hallmarks of aging and a 35-node age-related-disease panel. The passes remain configured by node-id lists at the top of each script; the outcome taxonomy that groups those ids is centralized in `graph_common`.
+
+**Shared foundation (`lib/graph_common.py`).** All analysis scripts import one module so the edge sign map, the outcome taxonomy, the breadth-floor policy, and the graph read have a single authoritative definition. It holds:
+
+* `EDGE_SIGN`: the one editorial-judgment layer. Each edge type maps to +1 (subject increases object), -1 (decreases), or 0 (not determinable from the type alone). Borderline calls (`encodes`, `recruits`, `detoxifies`, `cleaves`, `catalyzes`, `displaces`) are marked REVIEW in-line. Changing a sign here changes every downstream result. Edge types absent from the map are treated as sign-indeterminate and warned about on stderr, so new edge types entering the graph surface immediately. All 29 edge types currently in the graph are mapped.
+* **Outcome taxonomy.** `ANCHOR_OUTCOME_ID` (14, organismal aging, the outcome every lead is gated on), `SECONDARY_ANCHOR_ID` (171, maximum lifespan, reported but not gating), `HALLMARK_OUTCOME_IDS` (the twelve hallmark nodes), and `DISEASE_OUTCOME_IDS` (the 35-node disease panel). Membership is curated and explicit because `node_type` does not distinguish a hallmark process from a disease phenotype.
+* **Breadth-floor policy.** A disease outcome is "well fed" when its direct in-degree (curated incoming edges) is at least `WELL_FED_INDEGREE_K` (currently 5). `breadth_floor_for(well_fed_count)` returns the disease-breadth floor a lead must clear: base 2, plus one per `BREADTH_FLOOR_STEP` (8) well-fed diseases, capped at `BREADTH_FLOOR_CAP` (6). This ties the lead bar to disease-side curation depth, so it ratchets only as diseases are genuinely wired in, not as the graph grows overall, and keeps "lead" comparable across builds. Six diseases are well fed at K=5 today, so the floor is 2.
+* `load_graph_data(db_path)`: one read of `nodes` and `edges` into `{id: (name, type)}` and `[(subject, object, edge_type, sign)]`, plus an unmapped-type tally.
+* Structure builders: `build_reverse_adj` (backward walk from a sink), `build_digraph` (networkx DiGraph, structure only), `resolve_pair_signs` (one sign per ordered pair; a real +/- conflict resolves to None, a neutral-only pair to 0), and `count_well_fed_diseases(edges)` for the breadth-floor input.
+* `EXPORT_DIR = Python/export`. Outputs land here, deliberately not in `export_public/`, because analysis TSVs can carry DrugBank-derived node names verbatim.
+
+**The five passes.**
+
+* **`signed_path_net_effect.py`.** Backward signed-reachability from every outcome node (the two anchors, the twelve hallmarks, and the 35 diseases). For each upstream node it reports whether increasing it raises or lowers the outcome, as the product of edge signs along each path; any path crossing a neutral edge is reported indeterminate rather than guessed. A per-node `TARGET_POLARITY` map turns the raw sign into a recommended increase or decrease; polarity is set from each node's canonical semantics, so the ten damage-named hallmarks and every disease read -1 (less is better) while proteostasis and macroautophagy read +1 (the canonical name is the salutary state). Structural signed-reachability, not a simulation: direction is trustworthy, path-count reflects curation density not effect magnitude. Writes `signed_path_net_effect.tsv`, one row per (outcome, source) pair.
+* **`cycle_analysis.py`.** The gating diagnostic. It decomposes the graph into strongly connected components: if every SCC is a trivial singleton the graph is a DAG apart from self-loops and the attractor / feedback-vertex-set family is formally degenerate; a multi-node feedback core means those methods apply, restricted to it. Each enumerated cycle is labeled positive (amplifying), negative (homeostatic), indeterminate (neutral edge), or conflicting (a pair carrying both signs) via `resolve_pair_signs`. Its `OUTCOME_NODE_IDS` annotation now spans the full panel, flagging for each outcome whether it sits inside a feedback core. Writes `cycle_analysis.tsv`.
+* **`target_control.py`.** A structural target-control pass toward the outcome panel: restrict to the union of the targets' ancestor subgraphs, compute a Liu maximum-matching full-control reference, and report one matched-path-head driver per target, joined to the signed-path direction. Labeled throughout as a structural heuristic, not a paper-faithful Gao 2014 reconstruction and not a controllability guarantee. Writes `target_control.tsv`.
+* **`feedback_control_targets.py`.** The intersection of feedback structure and direction, now judged across the whole outcome panel rather than a single outcome. It computes the exact minimum feedback vertex set over the core (an integer program via `scipy.optimize.milp` / HiGHS, rank formulation, so no cycle enumeration and no length cap), the minimum hitting set over the positive cycles (break amplifying loops while sparing the homeostatic brakes; this one inherits the length cap), and per-node positive-cycle participation as the stable centrality ranking. These structural objects are outcome-independent and computed once. It then joins the signed-path direction for every outcome and, per core node, derives a coherent action (increase, decrease, or none), the favorable outcome set under that action, separate hallmark-breadth and disease-breadth counts, and a strict cross-outcome conflict flag (a clean opposite recommendation across outcomes, not a mixed or indeterminate one). Central nodes are labeled `clean_leverage`, `cross_outcome_conflict`, or `central_ambiguous`. Writes two files: `feedback_control_targets.tsv` (node-level summary, with breadth, conflict, aging-favorability, and coherent action) and `feedback_direction_by_outcome.tsv` (long format, one row per node-outcome pair).
+* **`build_report.py`.** The reporting pass, added in V15 and made multi-outcome in V16. Consumes `cycle_analysis.tsv`, `feedback_control_targets.tsv`, and `feedback_direction_by_outcome.tsv` (never `target_control.tsv`, whose driver identities are matching artifacts) plus the graph database, adds grounding metrics (degree normalization to flag single-file pass-through chokepoints, evidence depth, single-source dominance) and an external PubMed / Open Targets cross-check over the public HTTP APIs, and assigns each candidate a provisional lead / watch_item / curation_priority / cross_outcome_conflict / discard label. The lead gate is multi-outcome: a candidate must be central, cleanly favor the anchor outcome, cleanly favor at least `breadth_floor` distinct diseases, carry no cross-outcome conflict, and pass the evidence-depth, single-source, and external gates. The breadth floor is computed each build from the well-fed disease count via the `graph_common` policy and logged, alongside the count and the analyzable-outcome inventory, into an `outcomes` block in `build_report.json`. It reads no free-text fields, so the output is DrugBank-clean by construction. Writes `build_report.json` plus a dated archive under `export/build_reports/`. See the V16 and V15 change notes.
+
+**Method discipline.** The analyses are structural over curated topology and edge signs, not dynamical simulations. Direction is the trustworthy signal; magnitude and path-count are not. Minimum FVS and hitting sets are non-unique, so participation is the stable ranker. Positive-cycle enumeration is length-capped (`MAX_CYCLE_LENGTH`, default 8), while the all-cycle minimum FVS is exact and uncapped. Breadth is measured against the analyzable outcomes (those with at least one reachable source in the current build); a disease with no reachable sources is a curation gap, not a negative finding. Hallmark breadth and disease breadth are reported separately, because the hallmarks are facets of aging and folding them into one count would restate aging-favorability as independent reach. The disease-breadth floor for a lead is not a fixed constant; it rises with disease-side curation depth via the breadth-floor policy. Exact integer programs use `scipy.optimize.milp`; structure uses `networkx`. Each script is config-driven via constants at its top and can be run directly.
+
+**Runner.** `run_analysis.bat` activates the venv once and runs all five in order: signed_path first so the directional joins (in target_control and feedback_control_targets) read a fresh TSV, then cycle_analysis as the gating diagnostic, then target_control, then feedback_control_targets, and finally build_report to produce `build_report.json`. A non-zero exit from any pass stops the run. `run_feedback_control_targets.bat` runs the fourth pass alone.
+
 ## Current state
 
 | | |
 |---|---|
-| Corpus markdown documents | 869 |
-| Corpus chunks | 82,533 (8.25% over 512-token cap; 12.9% reference-section, filtered at retrieval) |
-| Corpus PubTator entities | 3,576 |
+| Corpus markdown documents | 961 |
+| Corpus chunks | 93,480 (~8% over 512-token cap; ~13% reference-section, filtered at retrieval) |
+| Corpus PubTator entities | 4,243 |
 | Books in corpus | 0 |
-| Graph nodes | 91 (78 with cross_references) |
-| Graph node aliases | 366 |
-| Graph edges | 85 |
-| Graph edge conditions | 106 |
-| Graph edge evidence | 146 |
-| Graph node observations | 127 |
+| Graph nodes | 783 (589 with cross_references) |
+| Graph node aliases | 3,057 |
+| Graph edges | 1,210 |
+| Graph edge conditions | 1,421 |
+| Graph edge evidence | 1,852 |
+| Graph node observations | 1,301 |
 | LEXICON DrugBank index | 19,871 drugs / 35,030 targets / 95,614 cross-references |
-| AXIOM MCP tools | 31 |
-| LEXICON MCP tools | 9 |
+| AXIOM MCP tools | 33 |
+| LEXICON MCP tools | 11 |
 
-The graph has grown substantially since the V13 snapshot (11 nodes / 9 edges / 3 observations, captured immediately after the V12 UPR-sensors seed). Top node types by count: `gene` (34), `process` (23), `protein` (12), `small_molecule` (8), `complex` (5), `phenotype` (5), `compartment` (2), `condition` (2). Top edge types: `suppresses` (24), `activates` (13), `induces` (13), `inhibits` (7), `encodes` (5), `promotes` (5), `part_of` (4), `transcribes` (4); the long tail covers `binds`, `causes`, `cleaves`, `contributes_to`, `deacetylates`, `matures_to`, `phosphorylates`, `supports`. The most-cited corpus source is "(2013) The Hallmarks of Aging.md" at 41 evidence rows, followed by Wang et al. 2025 on progerin-driven vascular aging in CKD (17), Buchwalter & Hetzer 2017 on nucleolar expansion (12), and the FOXM1 / senescence pair from Macedo et al. 2018 and Ribeiro et al. 2022 (9 and 6). The most-observed node is `progerin` (16 observations); followed by `Hutchinson-Gilford Progeria Syndrome` (8), `FOXM1` (7), `LMNA` (6), `cellular senescence` (6), `somatic mutagenesis` (5), and `lamin B1`, `nucleolus`, `AMPK`, `TOR signaling` further down. 78 of 91 nodes carry cross_references, consistent with LEXICON enrichment running as part of routine pre-flight.
+The graph has grown roughly ninefold in nodes since the V14 snapshot (91 nodes / 85 edges / 127 observations) and now spans well beyond the original progeria/UPR seed into senescence, glycation, NAD+ metabolism, immune surveillance, and, as of V16, an explicit panel of the twelve hallmarks of aging and 35 age-related diseases wired in as outcome nodes for the multi-outcome control analyses. Top node types by count: `gene` (316), `small_molecule` (158), `process` (120), `phenotype` (74), `protein` (40), `other` (25), `complex` (21), `condition` (16), `compartment` (6), `PTM_state` (5), `miRNA` (2). Top edge types: `suppresses` (348), `induces` (188), `promotes` (188), `contributes_to` (147), `activates` (77), `inhibits` (74), `part_of` (31), `binds` (27); the long tail covers `matures_to` (19), `causes` (17), `produces` (17), `degrades`, `cleaves`, `encodes`, `supports`, `transcribes`, `transports`, `synthesizes`, `increases`, `detoxifies`, `deacetylates`, `phosphorylates`, `recruits`, `catalyzes`, `regulates`, `s_nitrosylates`, `denitrosylates`, `displaces`, and `stabilizes`. All 29 edge types are mapped in `EDGE_SIGN`. The most-cited corpus source is "(2013) The Hallmarks of Aging.md" at 83 evidence rows, followed by "(2025) Immune surveillance of senescent cells in aging and disease.md" (43), "(2024) Mitophagy curtails cytosolic mtDNA-dependent activation of cGAS-STING inflammation during aging.md" (32), "(2023) Hallmarks of aging - An expanding universe.md" (29), and "(2009) Healing and Hurting - Molecular Mechanisms, Functions, and Pathologies of Cellular Senescence.md" (25). The most-observed node is `cellular senescence` (30 observations), followed by `carnosine` (25), `dietary glycation compound intake` (22), `maximum lifespan` (20), and a cluster at 18 (`organismal aging`, `progerin`, and others). 589 of 783 nodes carry cross_references; the disease and hallmark outcome nodes added for the analysis panel are largely unenriched so far, a near-term curation target.
 
-## Recent change in V14: bulk graph proposal tool
+## Recent change in V16: multi-outcome control and a curation-scaled lead bar
+
+V15's network-control layer routed every pass to two organismal endpoints, organismal aging and maximum lifespan. V16 widens the target set to the full curated outcome panel (the two anchors, the twelve hallmarks of aging, and a 35-node age-related-disease panel), and makes the feedback pass and the build report reason across all of them at once.
+
+The mechanical change is small because the structural objects (feedback core, minimum FVS, positive-cycle hitting set, participation) are outcome-independent and computed once; only the direction join is per-outcome. `feedback_control_targets.py` now loads the signed direction for every outcome and, per core node, derives a coherent push direction, separate hallmark and disease breadth, and a strict cross-outcome conflict flag (a clean opposite recommendation across outcomes). Nodes that help some outcomes and harm others are labeled `cross_outcome_conflict`, a first-class output that captures the real geroscience tradeoffs (the cellular-senescence-and-cancer case) rather than a lead. It emits a node-level summary plus a long-format `feedback_direction_by_outcome.tsv`.
+
+`build_report.py` gains the `cross_outcome_conflict` label and a multi-outcome lead gate: a lead must be central, cleanly favor organismal aging (the anchor), cleanly favor at least a breadth floor of distinct diseases with no conflict, and pass the existing grounding and external gates. Disease breadth is the translational signal and is featured in the lead; hallmark breadth is a secondary, mechanistic signal kept off the headline, because the hallmarks are facets of aging and would otherwise restate aging-favorability as independent reach.
+
+The lead's disease-breadth floor is not a fixed number. It is computed each build from disease-side curation depth: a disease counts as "well fed" at a direct in-degree of `WELL_FED_INDEGREE_K` (5), and the floor is base 2 plus one per eight well-fed diseases, capped at six (`graph_common.breadth_floor_for`). Six diseases are well fed today, so the floor is 2; it ratchets only as more diseases are genuinely wired in, and both the well-fed count and the floor are logged in the `outcomes` block of `build_report.json` so the step is deliberate and visible across builds. `SOP_build_insights_report.md` documents the policy and adds a verification step that re-derives the floor and flags any build-over-build change, because a lead certified under a higher floor is a stronger claim than one under a lower floor.
+
+The outcome taxonomy (anchor, secondary anchor, hallmark ids, disease ids) and the breadth-floor policy live in `graph_common.py` alongside `EDGE_SIGN`, so the multi-outcome definitions have one authoritative home. Polarity for each outcome is set in `signed_path_net_effect.py` from the node's canonical semantics; the two salutary-named hallmarks (proteostasis, macroautophagy) invert to +1 while the damage-named hallmarks and all diseases read -1.
+
+## Earlier change in V15: public reporting and publishing pipeline
+
+The network-control layer gained a fifth pass and a route to the public website.
+
+`build_report.py` (pass 5 of `run_analysis.bat`) consumes the four analysis TSVs and the graph database, computes per-candidate grounding metrics (degree normalization to catch pass-through chokepoints, evidence depth, and single-source dominance), runs an external cross-check over the public PubMed (NCBI E-utilities) and Open Targets GraphQL APIs, assigns a provisional lead / watch_item / curation_priority / discard label, diffs against the prior build, and writes `build_report.json` plus a dated archive under `export/build_reports/`. It reads no free-text fields, so the JSON is DrugBank-clean by construction. The external calls use the public HTTP APIs directly (stdlib `urllib`), not the bio-research MCP connectors, so the automated pipeline needs no authorization; the script degrades cleanly to a JSON-only artifact if the network is unavailable and never promotes a candidate to `lead` without the external leg.
+
+The prose report is a separate human-in-the-loop step, governed by `claude/SOP_build_insights_report.md`. A writer reads `build_report.json`, applies the judgment the script cannot (which single lead to feature, lay phrasing, honest caveats, the funding ask), and writes a short funder-facing `report.md` directly into `Python/export_public/`, overwriting the previous build's report. `run_publish_website.bat` then copies `report.md` alongside the redacted graph artifacts to the live Maypop Labs data folder; the `report.md` copy is guarded, so an absent report is skipped rather than fatal.
+
+The split is deliberate. Everything mechanical (metrics, external counts, labels, persistence) is scripted and reproducible in the JSON; everything requiring judgment stays with the writer, who never sources a public sentence from `notes` or `observation` free text. The SOP encodes the two mistakes caught during its design (confirming the FVS against the hitting set, and re-counting any "only X" or "most Y" superlative) as a mandatory verification step, run as a subagent for public-facing builds.
+
+## Earlier change in V14: bulk graph proposal tool
 
 V13's GRAPH PROPOSAL protocol required one MCP tool call per write: a separate call for each new node, each new edge, each evidence record, each observation, each condition. A medium paper-extraction commit could easily run 20-40 round trips. V14 collapses that to one.
 
@@ -266,15 +317,15 @@ The protocol implication: step 5 of the conversation protocol now collapses to o
 
 ## Tooling gaps surfaced this session
 
-* **Bulk LEXICON / DrugBank lookups.** With the graph-write side compressed to one round trip, the LEXICON pre-flight step (typically 5-15 lookups per paper, one per candidate node) is now the slowest part of a proposal. A `lexicon_lookup_batch(queries: [{query, hint?}])` (hint in `gene` / `protein` / `drug` / `compound` / `go_term`) and a `lexicon_find_drugs_by_targets(targets: [str], **filters)` would collapse that to 1-2 calls.
-* **Bulk `graph_find_nodes`.** Symmetric pre-flight against the curated graph. A `graph_find_nodes_batch(queries: [str])` would close the same per-paper sequence of name lookups.
+* **Bulk LEXICON / DrugBank lookups (shipped in V15).** `lexicon_lookup_batch(queries: [{query, hint?}])` and `lexicon_find_drugs_by_targets(targets, **filters)` now collapse the per-paper LEXICON pre-flight (formerly 5-15 single lookups) to 1-2 calls.
+* **Bulk `graph_find_nodes` (shipped in V15).** `graph_find_nodes_batch(queries)` closes the symmetric per-paper name-lookup sequence against the curated graph.
 * **No PMC full-text download tool.** Carried over from V13. The gap is between NCBI search (which yields PMIDs and PMC IDs) and the AXIOM Stage 01 pipeline (which consumes PDFs from the corpus inbox). A new `ncbi_download_pmc(pmid_or_pmcid, dest_dir)` would close it: hit `efetch.fcgi` with `db=pmc&rettype=full`, save NXML or PDF to a configured inbox, return the file path. Stages 01/03 then run on whatever lands there. Build only when corpus-expansion-via-conversation is wanted; manual download remains a viable alternative.
 * **`generate_config.py` is overwrite-not-merge with no warning.** Carried over from V11 and V13; still true. Adding a `--check` mode that diffs JSON-only servers against the manifest would warn before overwriting.
 
 ## Pending
 
 * `ncbi_download_pmc` (see Tooling gaps).
-* Bulk LEXICON / DrugBank lookups and bulk `graph_find_nodes` (see Tooling gaps).
+* Enrichment of the V16 outcome panel: most of the twelve hallmark and 35 disease outcome nodes still lack `cross_references`, and several diseases are wired too thinly (one to four incoming edges) to support disease-breadth claims. Deepening disease-side curation is what raises the computed breadth floor over time.
 * `AXIOM_Custom_Instructions.md` and SOP updates to switch the proposal protocol to commit-by-default (with the `graph_apply_proposal` report standing in for the prior approve-then-commit round trip) and to require a "considered but skipped" section so Claude's self-curation during extraction is visible and correctable rather than invisible.
 * Reference-section filter at chunk time (currently only at retrieval).
 * Token-aware fallback splitter for the 8.25% over-cap chunks.
@@ -286,7 +337,8 @@ The protocol implication: step 5 of the conversation protocol now collapses to o
 * **Books.** Scan a real book end to end before deciding on `--use_llm`, OpenLibrary metadata, chapter/subsection hierarchy, or `publisher`/`isbn` columns.
 * **LEXICON Tier 2.** Ensembl REST, Reactome, STRING, Open Targets, KEGG, miRBase, InterPro.
 * **FTS5 / BM25.** Current `keyword_search` ranks by raw whole-word count. BM25 via SQLite FTS5 on a virtual table would be the natural upgrade.
-* **Public publication of curated graph snapshots** via Maypop Labs.
+* **Multi-outcome public report.** V16 keeps the funder-facing report single-lead and aging-anchored, using disease breadth as supporting reach. A separate report type that presents the hallmark-by-disease influence matrix, or the cross-outcome conflict set, as its own artifact is deferred until the disease panel is curated deeply enough to carry it.
+* **Public publication of curated graph snapshots** via Maypop Labs. Partially implemented in V15: `run_publish_website.bat` pushes the redacted graph artifacts plus the build-report prose (`report.md`) to the live site data folder. Remaining work is publication cadence and the public-facing presentation of successive builds.
 
 ## Design principles
 
@@ -307,10 +359,11 @@ The protocol implication: step 5 of the conversation protocol now collapses to o
 15. **Source labeling on every grounding entry.** Corpus chunks, LEXICON returns, and labeled background are all valid grounding for graph writes. Provenance records the source type and identifier. Null results (e.g., empty LEXICON pharmacology for a TF target) belong in observations with the source labeled.
 16. **The manifest is the source of truth for MCP registration.** `claude_desktop_config.json` is downstream of `servers.toml`. Direct JSON edits are time bombs.
 17. **Bulk graph writes are atomic.** `graph_apply_proposal` either commits the entire batch or rolls back with no partial state. Validation reports all errors at once before any write happens. The per-call tools remain available for small commits and explicit visibility.
+18. **Analysis is structural, and its judgment layers are explicit and shared.** The network-control passes read the graph and never write it. Edge signs, the outcome taxonomy, and the breadth-floor policy are curator-controlled definitions in `graph_common.py`, so a change lands in one place and propagates to every pass. Direction is trusted; magnitude and path-count are not. Thresholds that gate a public "lead" scale with curation depth rather than being asserted.
 
 ## Tech stack
 
-Python 3.x. Marker (PDF -> markdown via vision OCR). bge-base-en-v1.5 (sentence-transformers, 768 dim). SQLite (corpus index, graph, LEXICON cache, DrugBank index). pypdf (Stage 02 page-count classifier). lxml (DrugBank XML parser; iterparse with byte-level pre-filter). httpx async (LEXICON HTTP clients, NCBI E-utilities client). FastMCP via the `mcp` Python SDK (all servers). cytoscape.js 3.30 (graph viewer, CDN-loaded). Hardware: RTX 2080 Ti, 11 GB VRAM.
+Python 3.x. Marker (PDF -> markdown via vision OCR). bge-base-en-v1.5 (sentence-transformers, 768 dim). SQLite (corpus index, graph, LEXICON cache, DrugBank index). pypdf (Stage 02 page-count classifier). lxml (DrugBank XML parser; iterparse with byte-level pre-filter). httpx async (LEXICON HTTP clients, NCBI E-utilities client). FastMCP via the `mcp` Python SDK (all servers). networkx + scipy (network-control analyses). cytoscape.js 3.30 (graph viewer, CDN-loaded). Hardware: RTX 2080 Ti, 11 GB VRAM.
 
 ## Directory layout
 
@@ -324,20 +377,35 @@ E:/bin/axiom/                         AXIOM project root
     02_PMID_lookup.py                 Stage 02 (with book classifier)
     03_chunk_and_embed.py             Stage 03
     04_graph_export.py                Stage 04
+    signed_path_net_effect.py         network analysis: signed-path net effect
+    cycle_analysis.py                 network analysis: feedback / SCC census
+    target_control.py                 network analysis: structural target control
+    feedback_control_targets.py       network analysis: FVS + multi-outcome direction
+    build_report.py                   network analysis: JSON build report (pass 5)
+    export/                           network-analysis TSVs + build_report.json
+      feedback_direction_by_outcome.tsv  long-format (node, outcome) directions
+      build_reports/                  dated build_report.json archives
+    export_public/                    redacted, publishable artifacts + report.md
     venv/                             AXIOM-owned venv
     templates/viewer.html             cytoscape.js viewer template
     lib/
       axiom_db.py                     corpus index DB layer
       axiom_graph_db.py               graph DB layer (write methods accept commit=)
+      graph_common.py                 network-analysis shared layer (EDGE_SIGN,
+                                      outcome taxonomy, breadth-floor policy, readers)
       pubmed.py, pubtator.py          API clients
       data/{axiom.db, axiom_graph.db}
   mcp/
-    server.py                         AXIOM MCP entry (31 tools)
+    server.py                         AXIOM MCP entry (33 tools)
     retrieval.py                      AxiomRetriever (embedding cache + search + RRF)
     graph.py                          GraphAccessor (graph DB + cross-DB enrichment;
                                       hosts apply_proposal and its validators)
-  claude/                             versioned project overviews
+    species.py                        derive_species (gene/protein species from cross_references)
+  claude/                             versioned project overviews + SOPs
   run_0X_*.bat                        convenience launchers
+  run_analysis.bat                    analysis + report launcher (5 passes)
+  run_feedback_control_targets.bat    standalone launcher for the 4th pass
+  run_publish_website.bat             publish redacted artifacts + report.md to site
 
 E:/bin/mcp/                           generic MCP collection root
   servers.toml                        manifest (source of truth)

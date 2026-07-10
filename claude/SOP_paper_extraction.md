@@ -138,6 +138,8 @@ Distinguish what the paper itself shows from what it cites. When the paper demon
 
 For review papers, bias toward author framing and synthetic conclusions. Cited mechanisms in a review can be promoted to the graph if the chunk asserts them clearly; record the inline citation as upstream provenance. When the upstream paper is itself in the corpus, prefer retrieving and grounding directly from it.
 
+Catalog and dossier-style papers (reviews or meta-analyses that enumerate many genes or proteins with a documented role in aging or age-related disease, each with a manipulation-to-phenotype fact) are a distinct case. Here the per-entity enumeration is the graph-worthy content, not a reproduction risk: promote each named gene as a node plus its manipulation-to-phenotype fact as an edge or observation, with the inline citation as upstream provenance. This is the gene dossier the project wants (custom-instructions Purpose and guideline 2), and it legitimately produces a high entry count from one paper. What is not promoted from such a paper, logged in Considered-but-skipped with the matching reason: (a) a bulk list referenced but not actually present in the retrieved chunks (a supplement table not in the corpus text cannot be grounded); (b) aggregate set-level statistics with no single intervention point (for example, "N% of inputs change expression with age"); (c) biomarker-overlap or model-comparison methodology. A named gene carrying a clean manipulation-to-phenotype fact is never skipped for volume.
+
 
 
 ## Step 4: Entity resolution
