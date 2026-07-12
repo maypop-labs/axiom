@@ -59,7 +59,7 @@ For specific recurring question shapes, the Standard procedures section below na
 
 ## Standard procedures
 
-Named SOPs codify recurring multi-step workflows. The SOP files are attached to the project. Each SOP refines the basic conversation protocol for a specific question shape and, with one exception, ends in a GRAPH PROPOSAL. The exception is the build insights report, which is a judgment-and-writing procedure that ends in a public report write rather than a graph proposal.
+Named SOPs codify recurring multi-step workflows. The SOP files are attached to the project. Each SOP refines the basic conversation protocol for a specific question shape and, with two exceptions, ends in a GRAPH PROPOSAL. The exceptions are the two report SOPs (build insights report and build specialist report), which are judgment-and-writing procedures that end in a public report write rather than a graph proposal.
 
 Invoke explicitly when triggered. Do not auto-invoke; default to the basic conversation protocol when no trigger phrase matches.
 
@@ -68,6 +68,9 @@ Invoke explicitly when triggered. Do not auto-invoke; default to the basic conve
 - **Edge audit** (`SOP_edge_audit.md`). Reviewing an existing curated edge against current corpus state. Trigger: "Audit the X --edge_type--> Y edge", "Run an edge audit on edge_id N", "Is the support for X to Y still solid?".
 - **Entity reconciliation** (`SOP_entity_reconciliation.md`). Identity ambiguity: candidate vs existing, suspected duplicate, or canonical-name update. Trigger: "Is X the same as Y in the graph?", "Reconcile [name 1] with [name 2]", "Audit identity for [name]".
 - **Build insights report** (`SOP_build_insights_report.md`). Turning a completed graph build into a short, honest, lay-audience report of the tentative leads the analysis surfaces. This SOP consumes `Python/export/build_report.json` and ends in a public report write to `Python/export_public/report.md`, not a GRAPH PROPOSAL. Trigger: "Write the build report", "Generate the public summary for tonight's build", "Build the insights report".
+- **Build specialist report** (`SOP_build_specialist_report.md`). The longer technical companion to the insights report, written from the same `Python/export/build_report.json` and ending in a public report write to `Python/export_public/specialist_report.md`, not a GRAPH PROPOSAL. It exposes the full candidate set, the structural objects, the multi-outcome breadth and conflict signals, and a closing Discussion, with every technical term defined for a reader with no prior knowledge of the project. Trigger: "Write the specialist report", "Generate the technical report for tonight's build", "Build the specialist report".
+
+Combined report trigger. When the user says "Build the report" or "Build the reports", or otherwise asks for the report or reports without naming which one, fire both report SOPs in sequence for the same build: `SOP_build_insights_report.md` first, then `SOP_build_specialist_report.md`. Insights runs first so the single featured lead is settled, and the specialist report's lead-in-depth section is then written to match it. Both consume the same `build_report.json`; do not rerun the analysis between them. Read each SOP file from disk before running it, per the rule below. If the user names one report specifically (for example "Build the insights report" or "Build the specialist report"), run only that one.
 
 SOPs may be invoked as sub-procedures from within other SOPs (most commonly, entity reconciliation called from inside paper extraction or connections dossier). When invoked as a sub-procedure, the SOP's findings feed back into the parent SOP's GRAPH PROPOSAL rather than producing an independent one.
 

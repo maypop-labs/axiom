@@ -1,4 +1,4 @@
-# Project AXIOM (V16)
+# Project AXIOM (V17)
 
 A curated biomedical literature corpus plus a curated mechanistic knowledge graph, accessed by Claude through local MCP servers. Single user, single machine, single corpus, single graph. The user (Neil) hand-selects sources; Claude retrieves and reasons over them; proposed graph additions go through explicit user review before commit. The asset is the curation, not the tooling.
 
@@ -277,7 +277,19 @@ As of V16 the layer is multi-outcome. Where it previously routed everything to t
 
 The graph has grown roughly ninefold in nodes since the V14 snapshot (91 nodes / 85 edges / 127 observations) and now spans well beyond the original progeria/UPR seed into senescence, glycation, NAD+ metabolism, immune surveillance, and, as of V16, an explicit panel of the twelve hallmarks of aging and 35 age-related diseases wired in as outcome nodes for the multi-outcome control analyses. Top node types by count: `gene` (316), `small_molecule` (158), `process` (120), `phenotype` (74), `protein` (40), `other` (25), `complex` (21), `condition` (16), `compartment` (6), `PTM_state` (5), `miRNA` (2). Top edge types: `suppresses` (348), `induces` (188), `promotes` (188), `contributes_to` (147), `activates` (77), `inhibits` (74), `part_of` (31), `binds` (27); the long tail covers `matures_to` (19), `causes` (17), `produces` (17), `degrades`, `cleaves`, `encodes`, `supports`, `transcribes`, `transports`, `synthesizes`, `increases`, `detoxifies`, `deacetylates`, `phosphorylates`, `recruits`, `catalyzes`, `regulates`, `s_nitrosylates`, `denitrosylates`, `displaces`, and `stabilizes`. All 29 edge types are mapped in `EDGE_SIGN`. The most-cited corpus source is "(2013) The Hallmarks of Aging.md" at 83 evidence rows, followed by "(2025) Immune surveillance of senescent cells in aging and disease.md" (43), "(2024) Mitophagy curtails cytosolic mtDNA-dependent activation of cGAS-STING inflammation during aging.md" (32), "(2023) Hallmarks of aging - An expanding universe.md" (29), and "(2009) Healing and Hurting - Molecular Mechanisms, Functions, and Pathologies of Cellular Senescence.md" (25). The most-observed node is `cellular senescence` (30 observations), followed by `carnosine` (25), `dietary glycation compound intake` (22), `maximum lifespan` (20), and a cluster at 18 (`organismal aging`, `progerin`, and others). 589 of 783 nodes carry cross_references; the disease and hallmark outcome nodes added for the analysis panel are largely unenriched so far, a near-term curation target.
 
-## Recent change in V16: multi-outcome control and a curation-scaled lead bar
+## Recent change in V17: technical specialist report
+
+V15 shipped a single funder-facing report: a short, lay-audience `report.md` that states one lead, written by `SOP_build_insights_report.md` from `build_report.json`. V17 adds a technical companion, `specialist_report.md`, written from the same JSON by a new sibling SOP, `SOP_build_specialist_report.md`, and published to the same place.
+
+Where the insights report deliberately withholds most of what `build_report.json` contains (one lead, no counts, no jargon, methods behind a link), the specialist report surfaces the rest: the full ranked candidate set with every label and metric, the structural objects (the strongly connected feedback core, the exact minimum feedback vertex set, the positive-cycle hitting set, and participation as the stable ranker), the multi-outcome breadth and cross-outcome conflict signals stated against their analyzable denominators, the external cross-check, the build-over-build persistence, and a closing Discussion. The Discussion is the one place either report synthesizes rather than reports; it is bounded to what is derivable from `build_report.json`, introduces no biology the map does not already contain, and never crosses into interventional or dosage framing. The report is self-contained: every technical term, biological and network-theoretic alike, is defined on first use, with a glossary, for a reader with no prior knowledge of the project.
+
+The sibling SOP reuses Steps 0 through 6 of `SOP_build_insights_report.md` verbatim (reading the JSON is identical) and diverges only on audience and voice, on what to include, on the sourcing guard, and on the verification pass. The sourcing guard is the load-bearing constraint: the prose derives only from canonical node names, the structural and grounding numbers, and the external counts, never from the `notes`, `observation`, or `edge_evidence` free-text fields. Because `build_report.json` is DrugBank-clean by construction, a report written from it alone drops into `export_public/` without passing the redaction filter, on the same basis as `report.md`.
+
+Two pieces of wiring accompany the report. `AXIOM_Custom_Instructions.md` registers the new SOP and adds a combined report trigger: "Build the report" or "Build the reports", or any request for the report without naming which, fires both report SOPs in sequence, insights first so the single featured lead is settled, then specialist so its lead-in-depth section matches. `run_publish_website.bat` now copies `specialist_report.md` alongside `report.md` to the live Maypop Labs data folder, guarded the same way, so an absent specialist report is skipped rather than fatal.
+
+Still deferred: the hallmark-by-disease influence matrix rendered as its own artifact. The specialist report summarizes breadth and conflict but does not render the full matrix.
+
+## Earlier change in V16: multi-outcome control and a curation-scaled lead bar
 
 V15's network-control layer routed every pass to two organismal endpoints, organismal aging and maximum lifespan. V16 widens the target set to the full curated outcome panel (the two anchors, the twelve hallmarks of aging, and a 35-node age-related-disease panel), and makes the feedback pass and the build report reason across all of them at once.
 
@@ -337,7 +349,7 @@ The protocol implication: step 5 of the conversation protocol now collapses to o
 * **Books.** Scan a real book end to end before deciding on `--use_llm`, OpenLibrary metadata, chapter/subsection hierarchy, or `publisher`/`isbn` columns.
 * **LEXICON Tier 2.** Ensembl REST, Reactome, STRING, Open Targets, KEGG, miRBase, InterPro.
 * **FTS5 / BM25.** Current `keyword_search` ranks by raw whole-word count. BM25 via SQLite FTS5 on a virtual table would be the natural upgrade.
-* **Multi-outcome public report.** V16 keeps the funder-facing report single-lead and aging-anchored, using disease breadth as supporting reach. A separate report type that presents the hallmark-by-disease influence matrix, or the cross-outcome conflict set, as its own artifact is deferred until the disease panel is curated deeply enough to carry it.
+* **Hallmark-by-disease influence matrix as its own artifact.** The V17 specialist report surfaces the cross-outcome conflict set and the full candidate breadth in prose, but neither report renders the hallmark-by-disease influence matrix as a standalone artifact. That is deferred until the disease panel is curated deeply enough to carry it.
 * **Public publication of curated graph snapshots** via Maypop Labs. Partially implemented in V15: `run_publish_website.bat` pushes the redacted graph artifacts plus the build-report prose (`report.md`) to the live site data folder. Remaining work is publication cadence and the public-facing presentation of successive builds.
 
 ## Design principles
@@ -385,7 +397,7 @@ E:/bin/axiom/                         AXIOM project root
     export/                           network-analysis TSVs + build_report.json
       feedback_direction_by_outcome.tsv  long-format (node, outcome) directions
       build_reports/                  dated build_report.json archives
-    export_public/                    redacted, publishable artifacts + report.md
+    export_public/                    redacted, publishable artifacts + report.md + specialist_report.md
     venv/                             AXIOM-owned venv
     templates/viewer.html             cytoscape.js viewer template
     lib/
