@@ -116,6 +116,14 @@ CREATE TABLE IF NOT EXISTS node_observations (
     -- GraphAccessor in the MCP layer.
     grounding_type TEXT NOT NULL DEFAULT 'corpus_primary',
 
+    -- Assertion polarity (V18). One of: 'asserting' (this source supports
+    -- the observation) or 'refuting' (this source tested the claim and
+    -- found it absent). Orthogonal to grounding_type: grounding_type says
+    -- where the row came from, assertion_status says which way it cuts.
+    -- A 'refuting' row must carry `method` or a justification naming the
+    -- test that returned null; validated by GraphAccessor, not by SQLite.
+    assertion_status TEXT NOT NULL DEFAULT 'asserting',
+
     -- Source-type-specific provenance, stored as JSON. Schema by
     -- grounding_type:
     --   corpus_primary       : NULL
@@ -176,14 +184,36 @@ CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(edge_type);
 -- Conditions: preconditions that scope when the edge holds. Free-form
 -- (type, value) pairs: cell_type=HEK293, compartment=nucleus,
 -- ptm_state=S473-phosphorylated, cofactor=ATP, etc.
+--
+-- evidence_id (V18) controls the scope of the condition:
+--   NULL     -> the condition scopes the whole edge (the original and
+--               still the default behaviour).
+--   not NULL -> the condition scopes exactly one evidence row. This is
+--               what lets one edge carry two evidence rows that differ
+--               only in the test applied (the ITP log-rank versus Gehan
+--               case), which edge-level conditions alone cannot express.
+--
+-- Uniqueness is enforced by two partial indexes rather than a table-level
+-- UNIQUE, because SQLite treats NULLs as distinct in a UNIQUE constraint:
+-- a plain UNIQUE(edge_id, evidence_id, condition_type, condition_value)
+-- would silently stop de-duplicating edge-scoped conditions.
+--
+-- The evidence_id index and the two partial unique indexes are NOT created
+-- here. They live in _apply_migrations, which runs after this script and is
+-- therefore the only place where the column is guaranteed to exist. Creating
+-- them here would abort executescript on any pre-V18 database, because
+-- CREATE TABLE IF NOT EXISTS is a no-op on the old table and the very next
+-- index statement would reference a column that the migration has not added
+-- yet. Do not move them back.
 CREATE TABLE IF NOT EXISTS edge_conditions (
     id INTEGER PRIMARY KEY,
     edge_id INTEGER NOT NULL,
+    evidence_id INTEGER DEFAULT NULL,
     condition_type TEXT NOT NULL,
     condition_value TEXT NOT NULL,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (edge_id) REFERENCES edges(id) ON DELETE CASCADE,
-    UNIQUE(edge_id, condition_type, condition_value)
+    FOREIGN KEY (evidence_id) REFERENCES edge_evidence(id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_conditions_edge ON edge_conditions(edge_id);
@@ -202,6 +232,14 @@ CREATE TABLE IF NOT EXISTS edge_evidence (
     -- layer (no CHECK constraint); validated at write time by
     -- GraphAccessor in the MCP layer.
     grounding_type TEXT NOT NULL DEFAULT 'corpus_primary',
+
+    -- Assertion polarity (V18). One of: 'asserting' or 'refuting'. See
+    -- node_observations.assertion_status. The edge-level rollup used by
+    -- the analysis layer is derived from these rows, never stored:
+    -- refuted  = at least one evidence row, all of them refuting
+    -- contested = both asserting and refuting rows present
+    -- asserted = everything else, including zero-evidence edges
+    assertion_status TEXT NOT NULL DEFAULT 'asserting',
 
     -- Source-type-specific provenance, stored as JSON. Schema by
     -- grounding_type matches node_observations.provenance_extra.
@@ -288,6 +326,16 @@ class AxiomGraphDatabase:
               provenance_extra = NULL. Semantic validation of which
               fields belong with which grounding_type lives in
               GraphAccessor at the MCP layer.
+            - V17 -> V18: add `assertion_status` to `edge_evidence` and
+              `node_observations`, backfilling every existing row to
+              'asserting' (correct: nothing recorded before V18 was a
+              refutation). Rebuild `edge_conditions` to add a nullable
+              `evidence_id` and to replace the table-level UNIQUE with
+              two partial unique indexes. The rebuild is required rather
+              than a plain ADD COLUMN because SQLite cannot alter a
+              constraint in place, and because UNIQUE treats NULLs as
+              distinct, which would have silently disabled edge-scoped
+              condition de-duplication.
         """
         cursor = self.connection.execute("PRAGMA table_info(nodes)")
         node_columns = {row[1] for row in cursor.fetchall()}
@@ -318,6 +366,106 @@ class AxiomGraphDatabase:
             "CREATE INDEX IF NOT EXISTS idx_observations_grounding_type "
             "ON node_observations(grounding_type)"
         )
+
+        # V17 -> V18: assertion polarity on evidence and observations.
+        for table in ("edge_evidence", "node_observations"):
+            cursor = self.connection.execute(f"PRAGMA table_info({table})")
+            existing_cols = {row[1] for row in cursor.fetchall()}
+            if "assertion_status" not in existing_cols:
+                self.connection.execute(
+                    f"ALTER TABLE {table} ADD COLUMN assertion_status TEXT "
+                    f"NOT NULL DEFAULT 'asserting'"
+                )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_evidence_assertion_status "
+            "ON edge_evidence(assertion_status)"
+        )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_observations_assertion_status "
+            "ON node_observations(assertion_status)"
+        )
+
+        # V17 -> V18: per-evidence condition scoping. Needs a table rebuild.
+        cursor = self.connection.execute("PRAGMA table_info(edge_conditions)")
+        condition_cols = {row[1] for row in cursor.fetchall()}
+        if "evidence_id" not in condition_cols:
+            self._rebuild_edge_conditions_v18()
+
+        # Partial unique indexes replacing the old table-level UNIQUE, plus
+        # the plain index on evidence_id. This is the ONLY place all three
+        # are created, for both fresh and migrated databases. SCHEMA_SQL
+        # deliberately omits them, because it runs before this method and
+        # would reference evidence_id on a pre-V18 table. Idempotent.
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_conditions_evidence "
+            "ON edge_conditions(evidence_id)"
+        )
+        self.connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "idx_conditions_unique_edge_scoped "
+            "ON edge_conditions(edge_id, condition_type, condition_value) "
+            "WHERE evidence_id IS NULL"
+        )
+        self.connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "idx_conditions_unique_evidence_scoped "
+            "ON edge_conditions(edge_id, evidence_id, condition_type, "
+            "condition_value) WHERE evidence_id IS NOT NULL"
+        )
+
+    def _rebuild_edge_conditions_v18(self):
+        """
+        Rebuild `edge_conditions` to add the nullable `evidence_id` column
+        and drop the table-level UNIQUE constraint.
+
+        SQLite cannot drop or alter a constraint in place, so the standard
+        create-copy-drop-rename dance is the only route. Every existing row
+        copies across with evidence_id = NULL, which preserves the original
+        edge-scoped semantics exactly.
+
+        Foreign keys are disabled for the swap. `edge_conditions` is a child
+        table on both of its foreign keys, so nothing cascades into it from
+        the drop, but the pragma keeps the rename from tripping SQLite's
+        reference rewriting. The pragma is a no-op inside a transaction, so
+        the pending work is committed first.
+        """
+        self.connection.commit()
+        self.connection.execute("PRAGMA foreign_keys = OFF")
+        try:
+            self.connection.executescript(
+                """
+                CREATE TABLE edge_conditions_v18 (
+                    id INTEGER PRIMARY KEY,
+                    edge_id INTEGER NOT NULL,
+                    evidence_id INTEGER DEFAULT NULL,
+                    condition_type TEXT NOT NULL,
+                    condition_value TEXT NOT NULL,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (edge_id) REFERENCES edges(id)
+                        ON DELETE CASCADE,
+                    FOREIGN KEY (evidence_id) REFERENCES edge_evidence(id)
+                        ON DELETE CASCADE
+                );
+
+                INSERT INTO edge_conditions_v18
+                    (id, edge_id, evidence_id, condition_type,
+                     condition_value, created_at)
+                SELECT id, edge_id, NULL, condition_type,
+                       condition_value, created_at
+                FROM edge_conditions;
+
+                DROP TABLE edge_conditions;
+                ALTER TABLE edge_conditions_v18 RENAME TO edge_conditions;
+
+                CREATE INDEX IF NOT EXISTS idx_conditions_edge
+                    ON edge_conditions(edge_id);
+                CREATE INDEX IF NOT EXISTS idx_conditions_type
+                    ON edge_conditions(condition_type);
+                """
+            )
+        finally:
+            self.connection.commit()
+            self.connection.execute("PRAGMA foreign_keys = ON")
 
     # -------------------------------------------------------------------------
     # Node Operations
@@ -658,10 +806,25 @@ class AxiomGraphDatabase:
     # Condition Operations
     # -------------------------------------------------------------------------
 
-    def add_condition(self, edge_id, condition_type, condition_value, commit=True):
+    def add_condition(self, edge_id, condition_type, condition_value,
+                      evidence_id=None, commit=True):
         """
-        Add a precondition to an edge. Silently ignores duplicates
-        (UNIQUE constraint on (edge_id, condition_type, condition_value)).
+        Add a precondition to an edge. Silently ignores duplicates.
+
+        Args:
+            edge_id: Target edge.
+            condition_type: Free-form scope dimension.
+            condition_value: Scope value.
+            evidence_id: When None (default), the condition scopes the whole
+                edge, which is the original behaviour. When set, it scopes
+                exactly that one evidence row, so two evidence rows on the
+                same edge can carry the same (type, value) pair without
+                colliding. Caller is responsible for checking that the
+                evidence row belongs to this edge; GraphAccessor does that.
+
+        Duplicate suppression is enforced by two partial unique indexes
+        rather than one table-level UNIQUE, so edge-scoped and
+        evidence-scoped conditions de-duplicate independently.
 
         Returns:
             int: The condition row id, or 0 if it was a duplicate.
@@ -669,12 +832,18 @@ class AxiomGraphDatabase:
         now = datetime.now().isoformat()
         cursor = self.connection.execute(
             """INSERT OR IGNORE INTO edge_conditions
-               (edge_id, condition_type, condition_value, created_at)
-               VALUES (?, ?, ?, ?)""",
-            (edge_id, condition_type, condition_value, now),
+               (edge_id, evidence_id, condition_type, condition_value,
+                created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (edge_id, evidence_id, condition_type, condition_value, now),
         )
         if commit:
             self.connection.commit()
+        # On a suppressed INSERT OR IGNORE, sqlite3 leaves lastrowid at the
+        # connection's previous value, so it would report a real but
+        # unrelated condition id. rowcount is the reliable discriminator.
+        if cursor.rowcount == 0:
+            return 0
         return cursor.lastrowid
 
     def get_conditions(self, edge_id):

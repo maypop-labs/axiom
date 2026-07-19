@@ -444,13 +444,36 @@ def fetch_graph(graph_db, corpus_db, filters):
                 ev.pop("conversation_question", None)
                 ev.pop("conversation_date", None)
 
+        condition_rows = graph_db.get_conditions(e["id"])
         conditions = [
             {
                 "condition_type": c["condition_type"],
                 "condition_value": c["condition_value"],
+                # V18: NULL means the condition scopes the whole edge;
+                # an id means it scopes only that one evidence row.
+                "evidence_id": (c["evidence_id"]
+                                if "evidence_id" in c.keys() else None),
             }
-            for c in graph_db.get_conditions(e["id"])
+            for c in condition_rows
         ]
+
+        # V18 assertion rollup, derived the same way graph_common does it so
+        # the published artifact and the analysis passes cannot disagree.
+        # A refuted edge is exported and labelled rather than dropped: the
+        # fact that a relation was tested and found absent is publishable
+        # content. Consumers must not draw it as a plain asserted edge.
+        polarities = [
+            (ev["assertion_status"] if "assertion_status" in ev else "asserting")
+            for ev in evidence
+        ]
+        n_refuting = sum(1 for p in polarities if p == "refuting")
+        n_asserting = len(polarities) - n_refuting
+        if n_refuting and not n_asserting:
+            assertion = "refuted"
+        elif n_refuting and n_asserting:
+            assertion = "contested"
+        else:
+            assertion = "asserted"
 
         edges.append({
             "id": e["id"],
@@ -459,6 +482,8 @@ def fetch_graph(graph_db, corpus_db, filters):
             "edge_type": e["edge_type"],
             "notes": e["notes"],
             "coverage": len(evidence),
+            "assertion": assertion,
+            "refuting_evidence_count": n_refuting,
             "conditions": conditions,
             "evidence": evidence,
         })
@@ -530,6 +555,7 @@ def export_graphml(nodes, edges, output_path):
         ("node", "observation_excerpt", "string"),
         ("edge", "edge_type", "string"),
         ("edge", "coverage", "int"),
+        ("edge", "assertion", "string"),
         ("edge", "conditions", "string"),
         ("edge", "top_citation", "string"),
         ("edge", "top_year", "int"),
@@ -577,6 +603,9 @@ def export_graphml(nodes, edges, output_path):
         edge.set("target", f"n{e['target']}")
         _add_data(edge, "edge_edge_type", e["edge_type"])
         _add_data(edge, "edge_coverage", e["coverage"])
+        # V18. Consumers styling this graph must not draw a refuted or
+        # contested edge the same way as an asserted one.
+        _add_data(edge, "edge_assertion", e.get("assertion", "asserted"))
         _add_data(
             edge,
             "edge_conditions",
@@ -631,8 +660,8 @@ def export_tsv(nodes, edges, output_dir):
         writer = csv.writer(f, delimiter="\t")
         writer.writerow([
             "id", "source_id", "target_id", "edge_type", "coverage",
-            "conditions", "evidence_count", "top_citation", "top_year",
-            "notes", "top_grounding_type",
+            "assertion", "conditions", "evidence_count", "top_citation",
+            "top_year", "notes", "top_grounding_type",
         ])
         for e in edges:
             top = e["evidence"][0] if e["evidence"] else {}
@@ -642,6 +671,7 @@ def export_tsv(nodes, edges, output_dir):
                 e["target"],
                 e["edge_type"],
                 e["coverage"],
+                e.get("assertion", "asserted"),
                 " | ".join(
                     f"{c['condition_type']}={c['condition_value']}"
                     for c in e["conditions"]

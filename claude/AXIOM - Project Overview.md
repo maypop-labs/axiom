@@ -1,4 +1,4 @@
-# Project AXIOM (V17)
+# Project AXIOM (V18)
 
 A curated biomedical literature corpus plus a curated mechanistic knowledge graph, accessed by Claude through local MCP servers. Single user, single machine, single corpus, single graph. The user (Neil) hand-selects sources; Claude retrieves and reasons over them; proposed graph additions go through explicit user review before commit. The asset is the curation, not the tooling.
 
@@ -104,7 +104,7 @@ Known imperfections (mitigated, not blocking):
 
 ### Stage 04: graph export (`04_graph_export.py`)
 
-Reads `axiom_graph.db` directly, joins evidence and observations to `axiom.db` for citations, emits `cytoscape-js` (with companion `viewer.html`), `graphml`, or `tsv` (nodes.tsv + edges.tsv + observations.tsv). Filters: `--node-type`, `--edge-type`, `--min-coverage`, `--year-min`, `--year-max`. Conversation metadata is scrubbed by default; `--include-conversation-metadata` retains it for audit dumps.
+Reads `axiom_graph.db` directly, joins evidence and observations to `axiom.db` for citations, emits `cytoscape-js` (with companion `viewer.html`), `graphml`, or `tsv` (nodes.tsv + edges.tsv + observations.tsv). Every edge carries a derived `assertion` attribute (`asserted`, `contested`, `refuted`) in all three formats, computed the same way `graph_common` computes it so the published artifact and the analysis passes cannot disagree; conditions carry their `evidence_id` scope. A refuted edge is exported and labelled rather than dropped, because the fact that a relation was tested and found absent is publishable content. Filters: `--node-type`, `--edge-type`, `--min-coverage`, `--year-min`, `--year-max`. Conversation metadata is scrubbed by default; `--include-conversation-metadata` retains it for audit dumps.
 
 The viewer template at `Python/templates/viewer.html` loads cytoscape.js 3.30 from a CDN. Serve the export directory with `python -m http.server` for local viewing (CORS blocks `file://` for the `graph.json` fetch).
 
@@ -162,14 +162,14 @@ Always preserve every `chunk_id` from rewritten entries. Always show before / af
 
 ### `axiom_graph.db` (curated graph)
 
-* `nodes`: `canonical_name` UNIQUE with `node_type`. Node types are open-ended (suggested: `gene`, `protein`, `miRNA`, `PTM_state`, `complex`, `process`, `phenotype`, `compartment`, `condition`, `small_molecule`, `other`). `cross_references` is a TEXT JSON column. Species is not stored: for gene and protein nodes it is derived at read time from `cross_references` (via `mcp/species.py`) and surfaced through `graph_find_nodes_by_species` and the `graph_stats` species histogram.
+* `nodes`: `canonical_name` UNIQUE with `node_type`. Node types are open-ended (suggested: `gene`, `protein`, `miRNA`, `oligonucleotide`, `PTM_state`, `complex`, `process`, `phenotype`, `compartment`, `condition`, `small_molecule`, `other`). `oligonucleotide` denotes a therapeutic nucleic-acid agent acting by sequence-complementary target engagement (siRNA, antisense oligonucleotide, aptamer, mRNA payload, guide RNA); it is deliberately distinct from `miRNA`, which is reserved for endogenous regulatory microRNAs rather than administered agents, and it removes such agents from `small_molecule`, where oligonucleotide biologics had previously been filed for want of a better type. `cross_references` is a TEXT JSON column. Species is not stored: for gene and protein nodes it is derived at read time from `cross_references` (via `mcp/species.py`) and surfaced through `graph_find_nodes_by_species` and the `graph_stats` species histogram.
 * `node_aliases`: alternate names, UNIQUE per node.
-* `node_observations`: per-node corpus-derived findings. One row per supporting chunk. Provenance fields immutable post-creation; only `observation` and `notes` editable. Carries `grounding_type` (one of `corpus_primary`, `corpus_inline_cited`, `lexicon`, `common_knowledge`, `background_weak`) and `provenance_extra` (TEXT JSON) for non-corpus provenance.
+* `node_observations`: per-node corpus-derived findings. One row per supporting chunk. Provenance fields immutable post-creation; only `observation` and `notes` editable. Carries `grounding_type` (one of `corpus_primary`, `corpus_inline_cited`, `lexicon`, `common_knowledge`, `background_weak`), `assertion_status` (`asserting` or `refuting`, V18), and `provenance_extra` (TEXT JSON) for non-corpus provenance.
 * `edges`: subject -> object directed multigraph keyed by `edge_type`. UNIQUE on `(subject_id, object_id, edge_type)`.
-* `edge_conditions`: free-form `(condition_type, condition_value)` pairs scoping when the edge holds.
-* `edge_evidence`: per-observation provenance. Two layers: corpus (`source_filename`, `source_doi`, `source_pmid`, `chunk_id`, `method`, `cell_system`) and conversation (`conversation_date`, `conversation_question`). Carries `grounding_type` and `provenance_extra` matching `node_observations`.
+* `edge_conditions`: free-form `(condition_type, condition_value)` pairs scoping when the edge holds. `evidence_id` (nullable, V18) selects the scope: NULL scopes the whole edge, which is the usual case, while an id scopes only that one evidence row, so a single edge can carry two rows that disagree because they tested different things. Uniqueness is enforced by two partial unique indexes rather than a table-level `UNIQUE`, because SQLite treats NULLs as distinct and a plain four-column constraint would silently stop de-duplicating edge-scoped conditions.
+* `edge_evidence`: per-observation provenance. Two layers: corpus (`source_filename`, `source_doi`, `source_pmid`, `chunk_id`, `method`, `cell_system`) and conversation (`conversation_date`, `conversation_question`). Carries `grounding_type`, `assertion_status`, and `provenance_extra` matching `node_observations`. A row with `assertion_status = 'refuting'` records that the source tested this claim and did not find it, and must supply `method` or `justification`.
 
-Cross-DB references on `edge_evidence` and `node_observations` are validated by `GraphAccessor` at write time, not by SQLite. Coverage of an edge is `COUNT(*)` of its evidence rows. `observation_count` for a node is `COUNT(*)` of its `node_observations`. Both are derived; nothing is stored.
+Cross-DB references on `edge_evidence` and `node_observations` are validated by `GraphAccessor` at write time, not by SQLite. Coverage of an edge is `COUNT(*)` of its evidence rows. `observation_count` for a node is `COUNT(*)` of its `node_observations`. An edge's assertion status (`asserted`, `contested`, `refuted`) is likewise computed from its evidence rows at read time. All three are derived; nothing is stored.
 
 Schema migrations land via `_apply_migrations` in `AxiomGraphDatabase.initialize()`, idempotent on every startup.
 
@@ -238,10 +238,10 @@ As of V16 the layer is multi-outcome. Where it previously routed everything to t
 
 **Shared foundation (`lib/graph_common.py`).** All analysis scripts import one module so the edge sign map, the outcome taxonomy, the breadth-floor policy, and the graph read have a single authoritative definition. It holds:
 
-* `EDGE_SIGN`: the one editorial-judgment layer. Each edge type maps to +1 (subject increases object), -1 (decreases), or 0 (not determinable from the type alone). Borderline calls (`encodes`, `recruits`, `detoxifies`, `cleaves`, `catalyzes`, `displaces`) are marked REVIEW in-line. Changing a sign here changes every downstream result. Edge types absent from the map are treated as sign-indeterminate and warned about on stderr, so new edge types entering the graph surface immediately. All 29 edge types currently in the graph are mapped.
+* `EDGE_SIGN`: the one editorial-judgment layer. Each edge type maps to +1 (subject increases object), -1 (decreases), or 0 (not determinable from the type alone). Borderline calls (`encodes`, `recruits`, `detoxifies`, `cleaves`, `catalyzes`, `displaces`) are marked REVIEW in-line. Changing a sign here changes every downstream result. Edge types absent from the map are treated as sign-indeterminate and warned about on stderr, so new edge types entering the graph surface immediately. Any currently-unmapped type is recorded in Pending with its editorial question, rather than counted here.
 * **Outcome taxonomy.** `ANCHOR_OUTCOME_ID` (14, organismal aging, the outcome every lead is gated on), `SECONDARY_ANCHOR_ID` (171, maximum lifespan, reported but not gating), `HALLMARK_OUTCOME_IDS` (the twelve hallmark nodes), and `DISEASE_OUTCOME_IDS` (the 35-node disease panel). Membership is curated and explicit because `node_type` does not distinguish a hallmark process from a disease phenotype.
 * **Breadth-floor policy.** A disease outcome is "well fed" when its direct in-degree (curated incoming edges) is at least `WELL_FED_INDEGREE_K` (currently 5). `breadth_floor_for(well_fed_count)` returns the disease-breadth floor a lead must clear: base 2, plus one per `BREADTH_FLOOR_STEP` (8) well-fed diseases, capped at `BREADTH_FLOOR_CAP` (6). This ties the lead bar to disease-side curation depth, so it ratchets only as diseases are genuinely wired in, not as the graph grows overall, and keeps "lead" comparable across builds. Six diseases are well fed at K=5 today, so the floor is 2.
-* `load_graph_data(db_path)`: one read of `nodes` and `edges` into `{id: (name, type)}` and `[(subject, object, edge_type, sign)]`, plus an unmapped-type tally.
+* `load_graph_data(db_path)`: one read of `nodes` and `edges` into `{id: (name, type)}` and `[(subject, object, edge_type, sign)]`, plus an unmapped-type tally and (V18) an assertion census. Returns a 4-tuple and excludes refuted edges by default, so a relation that was tested and found absent stops propagating through every pass at once rather than pass by pass.
 * Structure builders: `build_reverse_adj` (backward walk from a sink), `build_digraph` (networkx DiGraph, structure only), `resolve_pair_signs` (one sign per ordered pair; a real +/- conflict resolves to None, a neutral-only pair to 0), and `count_well_fed_diseases(edges)` for the breadth-floor input.
 * `EXPORT_DIR = Python/export`. Outputs land here, deliberately not in `export_public/`, because analysis TSVs can carry DrugBank-derived node names verbatim.
 
@@ -257,27 +257,40 @@ As of V16 the layer is multi-outcome. Where it previously routed everything to t
 
 **Runner.** `run_analysis.bat` activates the venv once and runs all five in order: signed_path first so the directional joins (in target_control and feedback_control_targets) read a fresh TSV, then cycle_analysis as the gating diagnostic, then target_control, then feedback_control_targets, and finally build_report to produce `build_report.json`. A non-zero exit from any pass stops the run. `run_feedback_control_targets.bat` runs the fourth pass alone.
 
-## Current state
+## Coverage and known gaps
 
-| | |
-|---|---|
-| Corpus markdown documents | 961 |
-| Corpus chunks | 93,480 (~8% over 512-token cap; ~13% reference-section, filtered at retrieval) |
-| Corpus PubTator entities | 4,243 |
-| Books in corpus | 0 |
-| Graph nodes | 783 (589 with cross_references) |
-| Graph node aliases | 3,057 |
-| Graph edges | 1,210 |
-| Graph edge conditions | 1,421 |
-| Graph edge evidence | 1,852 |
-| Graph node observations | 1,301 |
-| LEXICON DrugBank index | 19,871 drugs / 35,030 targets / 95,614 cross-references |
-| AXIOM MCP tools | 33 |
-| LEXICON MCP tools | 11 |
+**No counts live in this document.** Every figure describing the graph or the corpus is stale within hours of being written and is one tool call away. `graph_stats` returns node and edge totals, both type histograms, the derived species histogram, top-cited sources, and top-observed nodes; the custom instructions already require calling it at session start as the liveness probe, so the current numbers are always already in scope. Corpus totals come from `axiom.db` directly (`sources`, `chunks`, `pubtator_entities`). Tool counts are stated in the AXIOM MCP server and LEXICON MCP server sections above. The DrugBank index size is fixed until `load_drugbank.py` is re-run and is documented with that loader. Read every number from the live system, never from this file.
 
-The graph has grown roughly ninefold in nodes since the V14 snapshot (91 nodes / 85 edges / 127 observations) and now spans well beyond the original progeria/UPR seed into senescence, glycation, NAD+ metabolism, immune surveillance, and, as of V16, an explicit panel of the twelve hallmarks of aging and 35 age-related diseases wired in as outcome nodes for the multi-outcome control analyses. Top node types by count: `gene` (316), `small_molecule` (158), `process` (120), `phenotype` (74), `protein` (40), `other` (25), `complex` (21), `condition` (16), `compartment` (6), `PTM_state` (5), `miRNA` (2). Top edge types: `suppresses` (348), `induces` (188), `promotes` (188), `contributes_to` (147), `activates` (77), `inhibits` (74), `part_of` (31), `binds` (27); the long tail covers `matures_to` (19), `causes` (17), `produces` (17), `degrades`, `cleaves`, `encodes`, `supports`, `transcribes`, `transports`, `synthesizes`, `increases`, `detoxifies`, `deacetylates`, `phosphorylates`, `recruits`, `catalyzes`, `regulates`, `s_nitrosylates`, `denitrosylates`, `displaces`, and `stabilizes`. All 29 edge types are mapped in `EDGE_SIGN`. The most-cited corpus source is "(2013) The Hallmarks of Aging.md" at 83 evidence rows, followed by "(2025) Immune surveillance of senescent cells in aging and disease.md" (43), "(2024) Mitophagy curtails cytosolic mtDNA-dependent activation of cGAS-STING inflammation during aging.md" (32), "(2023) Hallmarks of aging - An expanding universe.md" (29), and "(2009) Healing and Hurting - Molecular Mechanisms, Functions, and Pathologies of Cellular Senescence.md" (25). The most-observed node is `cellular senescence` (30 observations), followed by `carnosine` (25), `dietary glycation compound intake` (22), `maximum lifespan` (20), and a cluster at 18 (`organismal aging`, `progerin`, and others). 589 of 783 nodes carry cross_references; the disease and hallmark outcome nodes added for the analysis panel are largely unenriched so far, a near-term curation target.
+What this section holds instead is the shape of the curation, which no tool call returns.
 
-## Recent change in V17: technical specialist report
+**Domain coverage.** Seeded on progeria and the unfolded protein response, and long since grown past that seed into cellular senescence and its immune surveillance, glycation and Maillard chemistry, NAD+ metabolism, mitophagy and cGAS-STING signalling, systemic circulating factors such as GDF11, iron homeostasis, comparative genomics of long-lived species, and, since V16, an explicit outcome panel comprising the twelve hallmarks of aging and a 35-node age-related-disease panel wired in for the multi-outcome control analyses. Most recently the ATTR amyloidosis arm added a worked example of one-time in vivo genome editing together with the lipid-nanoparticle delivery chassis it shares with the liver-directed RNA therapeutics.
+
+**Known-thin areas, in rough priority order.**
+
+* The V16 outcome panel is the thinnest region and the one that gates the most. Most hallmark and disease outcome nodes still lack `cross_references`, and several diseases carry only one to four incoming edges, too few to support a disease-breadth claim. Because the lead bar scales with disease-side curation depth via the breadth-floor policy, this is the area where curation effort most directly changes what the analysis is allowed to conclude.
+* Books remain at zero. The Stage 02 page-count classifier is wired but untested against a real book end to end, so every book-related deferral downstream of it is still speculative.
+* Roughly 8% of chunks exceed the 512-token embedding cap and are truncated at embed time while retaining full stored text; about 13% are reference-section content, screened out at retrieval but not at chunk time.
+* Species classification covers gene and protein nodes only, and a small tail of them derives as `unknown` for want of a nomenclature key in `cross_references`.
+
+**Curation trajectory.** Growth has been paper-driven rather than schematic: domains enter because a paper was extracted, not because a plan called for them. The consequence worth knowing when reading the graph is that density reflects reading history as much as biological importance, so path-count and node degree are indicators of curation attention and must never be read as effect magnitude. The analysis layer is built on this assumption throughout; see Method discipline above.
+
+## Recent change in V18: assertion polarity
+
+Before V18 the graph could only say that a relation holds. A source that tested a relation and found it absent had nowhere to go. The SOPs told curators to record such results as condition-scoped edges, but `graph_common.load_graph_data` reads only the `edges` table and never joins `edge_conditions`, so every negative result was counted as a full-strength positive assertion by all five analysis passes. The sharpest instance: `build_report.py` fed `node_evidence` into `distinct_sources`, which gates `EVIDENCE_DEPTH_FLOOR`, so a refuted edge could help promote a candidate to a published lead.
+
+V18 adds `assertion_status` to `edge_evidence` and `node_observations`, valued `asserting` (default) or `refuting`. A refuting row must carry `method` or `justification`, so the record shows what was tested rather than only that something failed.
+
+The edge-level rollup is derived in `graph_common` and never stored: an edge is `refuted` when it has evidence and all of it refutes, `contested` when both kinds are present, and `asserted` otherwise, including the zero-evidence case. Storing the rollup would have created a second source of truth free to drift from the evidence rows; deriving it means adding one row is the only operation needed to change an edge's standing. `load_graph_data` excludes refuted edges by default and returns an assertion census alongside the graph. `build_report.py` excludes refuted edges from `node_degree` and refuting rows from `node_evidence`, caps any candidate incident to a contested edge at `watch_item`, and logs an `assertions` block into `build_report.json`.
+
+Separately, `edge_conditions` gained a nullable `evidence_id`. A NULL scopes the condition to the whole edge, which is the usual case; an id scopes it to one evidence row. That is what lets a single edge carry two rows that disagree because they tested different things. The table-level `UNIQUE` was replaced by two partial unique indexes, because SQLite treats NULLs as distinct in a UNIQUE constraint and a plain four-column version would have silently stopped de-duplicating edge-scoped conditions.
+
+One implementation note worth keeping, because it cost a server outage. The three `evidence_id` indexes are created only in `_apply_migrations`, never in `SCHEMA_SQL`. `CREATE TABLE IF NOT EXISTS` is a no-op on a pre-V18 table, so an index statement in `SCHEMA_SQL` referencing `evidence_id` aborts `executescript` before the migration that would add the column can run, and no amount of restarting recovers it. Migrations that add a column must own every index over that column.
+
+Worked example, committed 2026-07-19. Reinke 2022 tested the thermoregulatory-mode hypothesis and found that ectotherms do not age more slowly than similarly sized endotherms. That is recorded as a refuting row on `metabolic rate --promotes--> demographic rate of aging` (edge 1744), stated in the direction the hypothesis asserts so the refutation attaches to the claim the literature actually made rather than to its inverse. Munch and Salinas 2009 then supplied an asserting row for the within-species temperature gradient, and the two are separated by `comparison_level` conditions scoped to their own evidence rows, so the edge reads as contested rather than incoherent. The exclusion was verified in between: with only the refuting row present, the graph gained an edge one hop from the anchor outcome while `signed_path_net_effect.tsv` came back byte-identical, and `build_report.json` reported `refuted: 1` naming edge 1744.
+
+Still deferred: the student viewer's styling for refuted and contested edges. `04_graph_export.py` emits the `assertion` attribute in cytoscape JSON, GraphML, and TSV, so the data is published; how to draw it is not yet decided.
+
+## Earlier change in V17: technical specialist report
 
 V15 shipped a single funder-facing report: a short, lay-audience `report.md` that states one lead, written by `SOP_build_insights_report.md` from `build_report.json`. V17 adds a technical companion, `specialist_report.md`, written from the same JSON by a new sibling SOP, `SOP_build_specialist_report.md`, and published to the same place.
 
@@ -338,7 +351,7 @@ The protocol implication: step 5 of the conversation protocol now collapses to o
 
 * `ncbi_download_pmc` (see Tooling gaps).
 * Enrichment of the V16 outcome panel: most of the twelve hallmark and 35 disease outcome nodes still lack `cross_references`, and several diseases are wired too thinly (one to four incoming edges) to support disease-breadth claims. Deepening disease-side curation is what raises the computed breadth floor over time.
-* `AXIOM_Custom_Instructions.md` and SOP updates to switch the proposal protocol to commit-by-default (with the `graph_apply_proposal` report standing in for the prior approve-then-commit round trip) and to require a "considered but skipped" section so Claude's self-curation during extraction is visible and correctable rather than invisible.
+* An `EDGE_SIGN` entry for `ubiquitylates` (6 edges, currently unmapped and warning on every analysis run). The sign is a real editorial call rather than an oversight: K48-linked ubiquitylation marks a substrate for degradation (-1), while K63-linked chains are non-degradative signalling (0 or +1), so the right resolution may be to split the edge type rather than to sign it as one thing.
 * Reference-section filter at chunk time (currently only at retrieval).
 * Token-aware fallback splitter for the 8.25% over-cap chunks.
 * `graph_path(node_a, node_b)` MCP tool when graph density makes multi-hop interesting.
@@ -372,6 +385,7 @@ The protocol implication: step 5 of the conversation protocol now collapses to o
 16. **The manifest is the source of truth for MCP registration.** `claude_desktop_config.json` is downstream of `servers.toml`. Direct JSON edits are time bombs.
 17. **Bulk graph writes are atomic.** `graph_apply_proposal` either commits the entire batch or rolls back with no partial state. Validation reports all errors at once before any write happens. The per-call tools remain available for small commits and explicit visibility.
 18. **Analysis is structural, and its judgment layers are explicit and shared.** The network-control passes read the graph and never write it. Edge signs, the outcome taxonomy, and the breadth-floor policy are curator-controlled definitions in `graph_common.py`, so a change lands in one place and propagates to every pass. Direction is trusted; magnitude and path-count are not. Thresholds that gate a public "lead" scale with curation depth rather than being asserted.
+19. **Absence of evidence is recorded, not omitted.** A relation that was tested and found absent is content, and it is carried as a refuting evidence row on the claim as stated. Never as a deletion, an inverted edge type, or a remark in `notes`: the first destroys the finding, the second asserts a claim no source made, and the third is invisible to every consumer. The edge-level rollup is derived from the rows, so there is one source of truth, and the analysis layer excludes refuted edges while keeping contested ones visible and capped. The graph should be able to say that a question was asked and answered in the negative, because that is what stops the same claim being re-proposed from the same paper six months later.
 
 ## Tech stack
 

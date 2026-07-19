@@ -63,6 +63,7 @@ from graph_common import (
     build_digraph,
     resolve_pair_signs,
     report_unmapped,
+    report_assertions,
     EXPORT_DIR,
     ANCHOR_OUTCOME_ID,
     SECONDARY_ANCHOR_ID,
@@ -329,8 +330,9 @@ def direction_class(verdict, direction):
 # ------------------------------- main ------------------------------------
 
 def main():
-    nodes, edges, unmapped = load_graph_data(DB_PATH)
+    nodes, edges, unmapped, assertions = load_graph_data(DB_PATH)
     report_unmapped(unmapped, sys.stderr)
+    report_assertions(assertions, sys.stderr)
 
     g = build_digraph(nodes, edges, include_self_loops=True)
     pair_signs = resolve_pair_signs(edges)

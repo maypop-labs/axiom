@@ -128,7 +128,14 @@ Walk substantive chunks. For each, identify candidate claims:
 
 - **Conditions and cell_system**: extract scope. "In HRas-driven OIS in melanocytes" is a condition (when the edge holds); "demonstrated in IMR-90 fibroblasts" is a cell_system anchored on evidence (where it was shown).
 
-- **Negative findings**: "X does not affect Y", "loss of A fails to rescue B". Often valuable as observations or condition-scoped negative edges.
+- **Negative findings**: "X does not affect Y", "loss of A fails to rescue B", "the predicted advantage was not observed". These are first-class content, not leftovers. Record them with `assertion_status: "refuting"` (V18) on the evidence or observation row. Do NOT record a negative as a plain edge scoped by a condition such as `result=null`: the analysis layer reads only the edges table and never joins `edge_conditions`, so a condition-scoped negative is counted as a full-strength positive assertion by every pass. Polarity has to sit on the row, which is where the loader looks.
+
+  Which shape to use:
+  - **The paper tested a specific relation between two entities and found none.** A refuting evidence row on that edge. Create the edge if it does not exist; an edge whose evidence is entirely refuting derives as `refuted` and is excluded from all five analysis passes by default, so it records the finding without polluting any result.
+  - **The paper refuted a hypothesis with no clean two-entity subject and object** (a class-level expectation, a whole-population prediction). A refuting observation on the most relevant node.
+  - Either way the row must carry `method` or `justification` naming the test that came up null. This is enforced at write time. A refutation without its test cannot be told apart from "never tested" by a later reader, which is the distinction the whole mechanism exists to preserve.
+
+  Note the asymmetry: `refuting` is a strong claim about a negative result, not weak grounding. It is orthogonal to `grounding_type`, which still records where the row came from. A well-powered null from a good paper is `corpus_primary` and `refuting`.
 
 
 

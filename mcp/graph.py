@@ -39,6 +39,16 @@ PERMITTED_GROUNDING_TYPES = frozenset({
     "background_weak",
 })
 
+# Permitted values for the V18 assertion_status column on edge_evidence
+# and node_observations. Orthogonal to grounding_type: grounding_type
+# records where a row came from, assertion_status records which way it
+# cuts. 'refuting' means the source tested the claim and found it absent,
+# which is a positive finding about a negative result, not weak grounding.
+PERMITTED_ASSERTION_STATUS = frozenset({
+    "asserting",
+    "refuting",
+})
+
 
 class GraphAccessor:
     """
@@ -100,6 +110,40 @@ class GraphAccessor:
                 f"{sorted(PERMITTED_GROUNDING_TYPES)}"
             )
         fields["grounding_type"] = grounding_type
+
+        # V18 assertion polarity. Validated ahead of the pre-serialized
+        # provenance_extra early-return below, so a refuting row cannot
+        # slip through unchecked by passing provenance_extra as a string.
+        assertion_status = fields.get("assertion_status") or "asserting"
+        if assertion_status not in PERMITTED_ASSERTION_STATUS:
+            raise ValueError(
+                f"Invalid assertion_status {assertion_status!r}. Permitted: "
+                f"{sorted(PERMITTED_ASSERTION_STATUS)}"
+            )
+        fields["assertion_status"] = assertion_status
+        if assertion_status == "refuting":
+            raw_extra = fields.get("provenance_extra")
+            if isinstance(raw_extra, str):
+                try:
+                    probe = json.loads(raw_extra)
+                except (json.JSONDecodeError, TypeError):
+                    probe = {}
+            elif isinstance(raw_extra, dict):
+                probe = raw_extra
+            else:
+                probe = {}
+            if not isinstance(probe, dict):
+                probe = {}
+            if not (fields.get("method")
+                    or fields.get("justification")
+                    or probe.get("justification")):
+                raise ValueError(
+                    "assertion_status='refuting' requires either `method` "
+                    "(the test or assay that returned null) or "
+                    "`justification`. A refutation without the test that "
+                    "produced it is not interpretable by a later reader, "
+                    "and cannot be distinguished from 'never tested'."
+                )
 
         # Pre-serialized JSON strings bypass dict-level validation.
         extra = fields.get("provenance_extra")
@@ -531,24 +575,48 @@ class GraphAccessor:
                 )
             raise
 
+        # Evidence is written BEFORE conditions (V18, reversed from the
+        # original order) so that a condition in the same call can scope
+        # itself to one of these evidence rows via `evidence_index`.
+        evidence_ids = []
+        if evidence:
+            for e in evidence:
+                evidence_ids.append(
+                    self.add_evidence(edge_id, commit=commit, **e)
+                )
+
         if conditions:
             for c in conditions:
                 try:
-                    self.graph_db.add_condition(
-                        edge_id,
-                        c["condition_type"] if "condition_type" in c else c["type"],
-                        c["condition_value"] if "condition_value" in c else c["value"],
-                        commit=commit,
-                    )
+                    ctype = (c["condition_type"] if "condition_type" in c
+                             else c["type"])
+                    cvalue = (c["condition_value"] if "condition_value" in c
+                              else c["value"])
                 except KeyError as e:
                     raise ValueError(
                         f"Condition dict missing required key: {e}. "
                         f"Expected 'condition_type'/'condition_value' or 'type'/'value'."
                     )
-
-        if evidence:
-            for e in evidence:
-                self.add_evidence(edge_id, commit=commit, **e)
+                evidence_index = c.get("evidence_index")
+                scoped_evidence_id = None
+                if evidence_index is not None:
+                    if not isinstance(evidence_index, int):
+                        raise ValueError(
+                            "Condition 'evidence_index' must be an int "
+                            "position into this edge's `evidence` list."
+                        )
+                    if not 0 <= evidence_index < len(evidence_ids):
+                        raise ValueError(
+                            f"Condition 'evidence_index' {evidence_index} is "
+                            f"out of range; this edge was given "
+                            f"{len(evidence_ids)} evidence row(s)."
+                        )
+                    scoped_evidence_id = evidence_ids[evidence_index]
+                self.graph_db.add_condition(
+                    edge_id, ctype, cvalue,
+                    evidence_id=scoped_evidence_id,
+                    commit=commit,
+                )
 
         return edge_id
 
@@ -584,11 +652,31 @@ class GraphAccessor:
         return self.graph_db.add_evidence(edge_id, commit=commit, **fields)
 
     def add_condition(self, edge_id, condition_type, condition_value,
-                      commit=True):
+                      evidence_id=None, commit=True):
+        """
+        Add a precondition to an edge.
+
+        evidence_id=None (default) scopes the condition to the whole edge.
+        Passing an evidence_id scopes it to that single evidence row, which
+        is how one edge carries two rows differing only in the test applied.
+        The evidence row must belong to this edge; a mismatch is an error
+        rather than a silent reparent.
+        """
         if self.graph_db.get_edge(edge_id) is None:
             raise ValueError(f"Edge {edge_id} not found")
+        if evidence_id is not None:
+            owners = {
+                row["id"] for row in self.graph_db.get_evidence_for_edge(edge_id)
+            }
+            if evidence_id not in owners:
+                raise ValueError(
+                    f"Evidence {evidence_id} does not belong to edge "
+                    f"{edge_id}; a condition can only scope an evidence row "
+                    f"on its own edge."
+                )
         return self.graph_db.add_condition(
-            edge_id, condition_type, condition_value, commit=commit,
+            edge_id, condition_type, condition_value,
+            evidence_id=evidence_id, commit=commit,
         )
 
     def update_edge(self, edge_id, subject_id=None, object_id=None,
@@ -1038,6 +1126,36 @@ class GraphAccessor:
                     ev_ok = False
             if not ev_ok:
                 continue
+            # `evidence_index` on an inline condition is a position into this
+            # edge's own `evidence` list. Validate it here so a bad index is
+            # reported alongside every other error, rather than raising in
+            # the write phase and rejecting the whole batch.
+            idx_ok = True
+            for j, c in enumerate(conds):
+                evidence_index = c.get("evidence_index")
+                if evidence_index is None:
+                    continue
+                if isinstance(evidence_index, bool) or not isinstance(
+                        evidence_index, int):
+                    errors.append({"section": "new_edges", "index": i,
+                                   "error": (
+                                       f"conditions[{j}] 'evidence_index' "
+                                       f"must be an int position into this "
+                                       f"edge's evidence list"
+                                   )})
+                    idx_ok = False
+                    continue
+                if not 0 <= evidence_index < len(ev_list):
+                    errors.append({"section": "new_edges", "index": i,
+                                   "error": (
+                                       f"conditions[{j}] 'evidence_index' "
+                                       f"{evidence_index} is out of range; "
+                                       f"this edge was given {len(ev_list)} "
+                                       f"evidence row(s)"
+                                   )})
+                    idx_ok = False
+            if not idx_ok:
+                continue
             new_edges_v.append({
                 "input_index": i,
                 "subject_resolved": subj_r,
@@ -1161,11 +1279,69 @@ class GraphAccessor:
                 errors.append({"section": "condition_additions", "index": i,
                                "error": f"edge {edge_id} not found"})
                 continue
+
+            # V18 optional evidence scoping. Either an existing evidence_id,
+            # or a forward reference into this same payload's
+            # evidence_additions (whose row ids do not exist yet at
+            # authoring time). Both are validated against the same edge.
+            ev_id = spec.get("evidence_id")
+            ev_ref = spec.get("evidence_addition_index")
+            if ev_id is not None and ev_ref is not None:
+                errors.append({"section": "condition_additions", "index": i,
+                               "error": "pass at most one of 'evidence_id' "
+                                        "and 'evidence_addition_index'"})
+                continue
+            if ev_id is not None:
+                if not isinstance(ev_id, int):
+                    errors.append({"section": "condition_additions",
+                                   "index": i,
+                                   "error": "evidence_id must be an int"})
+                    continue
+                owners = {
+                    r["id"]
+                    for r in self.graph_db.get_evidence_for_edge(edge_id)
+                }
+                if ev_id not in owners:
+                    errors.append({
+                        "section": "condition_additions", "index": i,
+                        "error": f"evidence {ev_id} does not belong to edge "
+                                 f"{edge_id}",
+                    })
+                    continue
+            if ev_ref is not None:
+                if not isinstance(ev_ref, int):
+                    errors.append({
+                        "section": "condition_additions", "index": i,
+                        "error": "evidence_addition_index must be an int",
+                    })
+                    continue
+                target = next(
+                    (v for v in evidence_v if v["input_index"] == ev_ref),
+                    None,
+                )
+                if target is None:
+                    errors.append({
+                        "section": "condition_additions", "index": i,
+                        "error": f"evidence_addition_index {ev_ref} does not "
+                                 f"match any validated evidence_additions "
+                                 f"entry",
+                    })
+                    continue
+                if target["edge_id"] != edge_id:
+                    errors.append({
+                        "section": "condition_additions", "index": i,
+                        "error": f"evidence_addition_index {ev_ref} targets "
+                                 f"edge {target['edge_id']}, not edge "
+                                 f"{edge_id}",
+                    })
+                    continue
             condition_v.append({
                 "input_index": i,
                 "edge_id": edge_id,
                 "condition_type": ct,
                 "condition_value": cv,
+                "evidence_id": ev_id,
+                "evidence_addition_index": ev_ref,
             })
 
         # 7. observation_rewrites
@@ -1363,6 +1539,10 @@ class GraphAccessor:
             "previous_values_for_in_place_edits": [],
         }
         node_index = validated["_node_index"]
+        # input_index of an evidence_additions entry -> the row id it created.
+        # Lets a condition_addition in the same payload scope itself to an
+        # evidence row that did not exist when the payload was written.
+        evidence_ids_by_input_index = {}
 
         # 1. new_nodes
         for vnode in validated["new_nodes"]:
@@ -1446,20 +1626,12 @@ class GraphAccessor:
             )
             if existing is not None:
                 edge_id = existing["id"]
-                cond_added = 0
-                for c in vedge["conditions"]:
-                    ct = c.get("condition_type", c.get("type"))
-                    cv = c.get("condition_value", c.get("value"))
-                    new_cid = self.graph_db.add_condition(
-                        edge_id, ct, cv, commit=False,
-                    )
-                    if new_cid:
-                        cond_added += 1
-                        report["stats"]["conditions_added"] += 1
-                        report["rollback_additions"].append({
-                            "tool": "graph_delete_condition",
-                            "args": {"condition_id": new_cid},
-                        })
+                # Evidence is written BEFORE conditions (V18), matching the
+                # order in add_edge, so that a condition in this same payload
+                # can scope itself to one of these evidence rows via
+                # `evidence_index`. Without this, an inline condition on a
+                # new_edge that happened to match an existing edge would
+                # silently land edge-scoped.
                 ev_added_ids = []
                 for ev in vedge["evidence"]:
                     new_ev_id = self.add_evidence(
@@ -1471,6 +1643,37 @@ class GraphAccessor:
                         "tool": "graph_delete_evidence",
                         "args": {"evidence_id": new_ev_id},
                     })
+                cond_added = 0
+                for c in vedge["conditions"]:
+                    ct = c.get("condition_type", c.get("type"))
+                    cv = c.get("condition_value", c.get("value"))
+                    evidence_index = c.get("evidence_index")
+                    scoped_evidence_id = None
+                    if evidence_index is not None:
+                        if not isinstance(evidence_index, int):
+                            raise ValueError(
+                                "Condition 'evidence_index' must be an int "
+                                "position into this edge's `evidence` list."
+                            )
+                        if not 0 <= evidence_index < len(ev_added_ids):
+                            raise ValueError(
+                                f"Condition 'evidence_index' {evidence_index} "
+                                f"is out of range; this edge was given "
+                                f"{len(ev_added_ids)} evidence row(s)."
+                            )
+                        scoped_evidence_id = ev_added_ids[evidence_index]
+                    new_cid = self.graph_db.add_condition(
+                        edge_id, ct, cv,
+                        evidence_id=scoped_evidence_id,
+                        commit=False,
+                    )
+                    if new_cid:
+                        cond_added += 1
+                        report["stats"]["conditions_added"] += 1
+                        report["rollback_additions"].append({
+                            "tool": "graph_delete_condition",
+                            "args": {"condition_id": new_cid},
+                        })
                 report["stats"]["edges_matched"] += 1
                 report["items"]["new_edges"].append({
                     "input_index": vedge["input_index"],
@@ -1569,11 +1772,18 @@ class GraphAccessor:
                 "tool": "graph_delete_evidence",
                 "args": {"evidence_id": ev_id},
             })
+            evidence_ids_by_input_index[ve["input_index"]] = ev_id
 
         # 6. condition_additions
         for vc in validated["condition_additions"]:
+            scoped_evidence_id = vc.get("evidence_id")
+            if scoped_evidence_id is None:
+                ref = vc.get("evidence_addition_index")
+                if ref is not None:
+                    scoped_evidence_id = evidence_ids_by_input_index.get(ref)
             cid = self.graph_db.add_condition(
                 vc["edge_id"], vc["condition_type"], vc["condition_value"],
+                evidence_id=scoped_evidence_id,
                 commit=False,
             )
             if cid:

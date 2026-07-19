@@ -50,6 +50,7 @@ from graph_common import (
     load_graph_data,
     build_digraph,
     report_unmapped,
+    report_assertions,
     EXPORT_DIR,
 )
 
@@ -149,8 +150,9 @@ def load_signed_path(path):
 # ------------------------------- main ------------------------------------
 
 def main():
-    nodes, edges, unmapped = load_graph_data(DB_PATH)
+    nodes, edges, unmapped, assertions = load_graph_data(DB_PATH)
     report_unmapped(unmapped, sys.stderr)
+    report_assertions(assertions, sys.stderr)
 
     g = build_digraph(nodes, edges, include_self_loops=True)
 

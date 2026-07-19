@@ -43,6 +43,7 @@ from graph_common import (
     load_graph_data,
     build_reverse_adj,
     report_unmapped,
+    report_assertions,
     EXPORT_DIR,
 )
 
@@ -257,9 +258,10 @@ def sort_key(item):
 # ------------------------------- output ----------------------------------
 
 def main():
-    nodes, edges, unmapped = load_graph_data(DB_PATH)
+    nodes, edges, unmapped, assertions = load_graph_data(DB_PATH)
     reverse_adj = build_reverse_adj(edges, skip_self_loops=True)
     report_unmapped(unmapped, sys.stderr)
+    report_assertions(assertions, sys.stderr)
 
     if LIST_CANDIDATE_TARGETS:
         wanted_types = {t.lower() for t in CANDIDATE_TARGET_TYPES}

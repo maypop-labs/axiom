@@ -446,8 +446,9 @@ def graph_get_node(
         node_id: Numeric node id.
         name: Canonical name (must be paired with node_type).
         node_type: Suggested values are 'gene', 'protein', 'miRNA',
-            'PTM_state', 'complex', 'process', 'phenotype', 'compartment',
-            'condition', 'small_molecule', 'other'.
+            'oligonucleotide', 'PTM_state', 'complex', 'process',
+            'phenotype', 'compartment', 'condition', 'small_molecule',
+            'other'.
 
     Returns:
         Dict with id, canonical_name, node_type, notes, cross_references
@@ -676,10 +677,16 @@ def graph_add_node(
     """
     Create a new node.
 
-    Suggested node_type values: 'gene', 'protein', 'miRNA', 'PTM_state',
-    'complex', 'process', 'phenotype', 'compartment', 'condition',
-    'small_molecule', 'other'. Not enforced; you can introduce a new
-    type if needed.
+    Suggested node_type values: 'gene', 'protein', 'miRNA',
+    'oligonucleotide', 'PTM_state', 'complex', 'process', 'phenotype',
+    'compartment', 'condition', 'small_molecule', 'other'. Not enforced;
+    you can introduce a new type if needed.
+
+    'oligonucleotide' is a therapeutic nucleic-acid agent acting by
+    sequence-complementary target engagement (siRNA, antisense
+    oligonucleotide, aptamer, mRNA payload, guide RNA). Use 'miRNA' only
+    for an endogenous regulatory microRNA, never for an administered
+    agent; that is the boundary these two types exist to separate.
 
     Args:
         canonical_name: Primary name for the entity.
@@ -794,6 +801,7 @@ def graph_add_edge(
 def graph_add_evidence(
     edge_id: int,
     grounding_type: str = "corpus_primary",
+    assertion_status: str = "asserting",
     source_filename: str | None = None,
     source_doi: str | None = None,
     source_pmid: str | None = None,
@@ -840,6 +848,16 @@ def graph_add_evidence(
         edge_id: Target edge.
         grounding_type: One of 'corpus_primary', 'corpus_inline_cited',
             'lexicon', 'common_knowledge', 'background_weak'.
+        assertion_status: 'asserting' (default) or 'refuting' (V18).
+            'refuting' records that this source tested the edge's claim
+            and did not find it, which is how a negative result enters
+            the graph. Either method or justification must be supplied
+            with a refuting row, so the reader can see what was tested.
+            The edge-level rollup is derived, never stored: an edge is
+            refuted when it has evidence and all of it refutes,
+            contested when both kinds are present, and asserted
+            otherwise. Refuted edges are excluded from the analysis
+            passes by default.
         source_filename: Markdown filename in the AXIOM corpus.
             Auto-filled from chunk_id when not provided.
         source_doi: DOI of the source paper.
@@ -866,7 +884,7 @@ def graph_add_evidence(
 
     Returns:
         Dict with id (evidence id), edge_id, new_coverage, grounding_type,
-        and message.
+        assertion_status, and message.
     """
     evidence_id = graph.add_evidence(
         edge_id,
@@ -884,6 +902,7 @@ def graph_add_evidence(
         justification=justification,
         conversation_question=conversation_question,
         notes=notes,
+        assertion_status=assertion_status,
     )
     coverage = graph.graph_db.count_evidence(edge_id=edge_id)
     return {
@@ -891,9 +910,11 @@ def graph_add_evidence(
         "edge_id": edge_id,
         "new_coverage": coverage,
         "grounding_type": grounding_type,
+        "assertion_status": assertion_status,
         "message": (
             f"Added evidence {evidence_id} to edge {edge_id} "
-            f"({grounding_type}); coverage now {coverage}"
+            f"({grounding_type}, {assertion_status}); "
+            f"coverage now {coverage}"
         ),
     }
 
@@ -903,6 +924,7 @@ def graph_add_condition(
     edge_id: int,
     condition_type: str,
     condition_value: str,
+    evidence_id: int | None = None,
 ) -> dict:
     """
     Add a precondition to an existing edge.
@@ -917,17 +939,31 @@ def graph_add_condition(
             'ptm_state', 'cofactor').
         condition_value: Value (e.g., 'HEK293', 'nucleus',
             'S473-phosphorylated').
+        evidence_id: Optional (V18). When omitted, the condition scopes
+            the whole edge, which is the usual case. When supplied, it
+            scopes only that one evidence row, which is how a single
+            edge carries two rows that differ solely in the test used
+            (for example a log-rank null alongside a Gehan positive).
+            The evidence row must belong to this edge.
 
     Returns:
-        Dict with id and message. Duplicate condition tuples are
-        silently ignored (id will be 0).
+        Dict with id, scope, and message. Duplicate condition tuples are
+        silently ignored (id will be 0). Edge-scoped and evidence-scoped
+        duplicates are tracked independently, so the same (type, value)
+        may legitimately appear once per evidence row.
     """
-    cond_id = graph.add_condition(edge_id, condition_type, condition_value)
+    cond_id = graph.add_condition(
+        edge_id, condition_type, condition_value, evidence_id=evidence_id,
+    )
+    scope = "edge" if evidence_id is None else f"evidence {evidence_id}"
     return {
         "id": cond_id,
+        "edge_id": edge_id,
+        "evidence_id": evidence_id,
+        "scope": scope,
         "message": (
             f"Added condition {condition_type}={condition_value} "
-            f"to edge {edge_id}"
+            f"to edge {edge_id} (scope: {scope})"
         ),
     }
 
@@ -937,6 +973,7 @@ def graph_add_observation(
     node_id: int,
     observation: str,
     grounding_type: str = "corpus_primary",
+    assertion_status: str = "asserting",
     chunk_id: int | None = None,
     source_filename: str | None = None,
     source_doi: str | None = None,
@@ -983,6 +1020,9 @@ def graph_add_observation(
         observation: The finding text (in your own words).
         grounding_type: One of 'corpus_primary', 'corpus_inline_cited',
             'lexicon', 'common_knowledge', 'background_weak'.
+        assertion_status: 'asserting' (default) or 'refuting' (V18).
+            Use 'refuting' for a finding that tested a claim and did not
+            support it. See graph_add_evidence for the full semantics.
         chunk_id: Specific chunk that supports the observation. Required
             for corpus_primary and corpus_inline_cited; forbidden otherwise.
         source_filename: Markdown filename in the AXIOM corpus.
@@ -1005,7 +1045,8 @@ def graph_add_observation(
 
     Returns:
         Dict with id (observation row id), node_id,
-        new_observation_count, grounding_type, and message.
+        new_observation_count, grounding_type, assertion_status, and
+        message.
 
     Raises:
         ValueError if the node does not exist, if chunk_id is provided
@@ -1029,6 +1070,7 @@ def graph_add_observation(
         justification=justification,
         conversation_question=conversation_question,
         notes=notes,
+        assertion_status=assertion_status,
     )
     new_count = graph.graph_db.count_observations(node_id=node_id)
     return {
@@ -1036,9 +1078,11 @@ def graph_add_observation(
         "node_id": node_id,
         "new_observation_count": new_count,
         "grounding_type": grounding_type,
+        "assertion_status": assertion_status,
         "message": (
             f"Added observation {obs_id} to node {node_id} "
-            f"({grounding_type}); observation count now {new_count}"
+            f"({grounding_type}, {assertion_status}); "
+            f"observation count now {new_count}"
         ),
     }
 
@@ -1273,7 +1317,8 @@ def graph_apply_proposal(proposal: dict) -> dict:
             "subject": <node ref>,
             "object": <node ref>,
             "edge_type": str (required),
-            "conditions": [{"condition_type", "condition_value"}, ...] | None,
+            "conditions": [{"condition_type", "condition_value",
+                            "evidence_index": int | None}, ...] | None,
             "evidence": [{<grounding fields>}, ...] | None,
             "notes": str | None,
         }
@@ -1296,6 +1341,8 @@ def graph_apply_proposal(proposal: dict) -> dict:
         condition_additions[i] = {
             "edge_id": int,
             "condition_type": str, "condition_value": str,
+            "evidence_id": int | None,
+            "evidence_addition_index": int | None,
         }
 
         observation_rewrites[i] = {
@@ -1333,6 +1380,20 @@ def graph_apply_proposal(proposal: dict) -> dict:
         common_knowledge    -> justification required; chunk_id forbidden
         background_weak     -> justification required; chunk_id forbidden;
                                auto-tagged weakest_grounding=True
+
+    Every evidence and observation dict also accepts assertion_status,
+    'asserting' (default) or 'refuting' (V18). A refuting row requires
+    method or justification. See graph_add_evidence.
+
+    CONDITION SCOPING (V18). A condition scopes the whole edge when no
+    evidence is named, which is the usual case. To scope one evidence
+    row instead:
+        in new_edges, set "evidence_index" on the inline condition to a
+            position in that same edge's "evidence" list;
+        in condition_additions, set "evidence_id" to an existing row on
+            that edge, or "evidence_addition_index" to a position in
+            this payload's evidence_additions. Pass at most one.
+    Either way the referenced evidence must belong to the same edge.
 
     RETURNS:
 

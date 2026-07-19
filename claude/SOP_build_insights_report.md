@@ -16,7 +16,7 @@ procedure that consumes that JSON and produces prose.
 ## What this SOP does and does not do
 
 It decides which single lead to feature, glosses the biology for a lay reader,
-phrases the honest claim, and writes the funding ask. It also reads the
+phrases the honest claim, and states the most valuable open question. It also reads the
 multi-outcome breadth and conflict signals to choose that lead and to surface any
 cross-outcome tradeoff. It does not recompute the
 metrics; those come from `build_report.json`. The by-hand database queries and
@@ -26,7 +26,7 @@ checked against source.
 
 ## Audience and voice
 
-The reader is assumed to be a prospective funder with no domain knowledge who
+The reader is assumed to be an interested general reader with no domain knowledge who
 wants to know whether the project is finding anything worthwhile. Accordingly:
 
 - No node counts, edge counts, or graph jargon in the prose. Those are
@@ -108,8 +108,7 @@ the script's proposal, not the final word; Step 4 is where you confirm or
 override with a stated reason.
 
 The `curation_priority` entries (high centrality, unresolved direction, for
-example AGER) are a first-class output, not a leftover. They are the project's
-most valuable open question and double as the funding ask.
+example AGER) are a first-class output, not a leftover.
 
 ## Step 3: Read the breadth and conflict signal
 
@@ -122,8 +121,8 @@ hallmarks, and the disease panel. Each candidate carries `coherent_action`
 
 - `aging_favorable` is the gate. A lead must cleanly favor the anchor outcome.
   `lifespan_favorable` is reported for context but does not gate.
-- `disease_breadth` is the translational signal and the reason a lead earns a
-  funder's attention: one lever moving many age-related diseases the right way.
+- `disease_breadth` is the translational signal and the reason a lead is
+  worth featuring: one lever moving many age-related diseases the right way.
   Read it against `outcomes.disease_outcomes_analyzable`, never against the full
   disease list and never against the dropped outcomes. The script requires it to
   reach `outcomes.breadth_floor` for a lead. That floor is not fixed: it is
@@ -136,8 +135,8 @@ hallmarks, and the disease panel. Each candidate carries `coherent_action`
 - `conflict` true means the node cleanly helps some outcomes and cleanly harms
   others (the cellular-senescence-and-cancer case). The script labels these
   `cross_outcome_conflict` and never `lead`; do not override that. These nodes
-  are first-class output, not noise: they are the honest tradeoff and often the
-  strongest funding ask. Report the tradeoff plainly and name the outcomes on
+  are first-class output, not noise: they are the honest tradeoff.
+  Report the tradeoff plainly and name the outcomes on
   each side from `conflict_outcome_ids`.
 
 ## Step 4: Judgment review of each candidate
@@ -197,12 +196,12 @@ trends.
 ## Step 7: Compose
 
 Write the prose per the Audience and voice section: one lead, at most one
-watch-item, the curation priority as the ask, the amplifying-to-damping ratio as
+watch-item, the curation priority as the next step, the amplifying-to-damping ratio as
 the one structural hook, methods and numbers behind a link. State the lead's
 reach as its disease breadth ("favorable across N of the M analyzable diseases,
 and no outcome it moves the wrong way"), not as a node count. If a
 `cross_outcome_conflict` node is present, it is the one tradeoff paragraph and
-frequently the funding ask, standing in for or joining the `curation_priority`.
+frequently the most important thing to report, standing in for or joining the `curation_priority`.
 
 Save. Write the finished prose directly to `Python/export_public/report.md`,
 overwriting the previous build's report. This is a public-folder write with no

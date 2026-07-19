@@ -74,6 +74,8 @@ from graph_common import (
     DISEASE_OUTCOME_IDS,
     WELL_FED_INDEGREE_K,
     breadth_floor_for,
+    edge_assertion_status,
+    count_well_fed_diseases_from_db,
 )
 
 
@@ -207,42 +209,80 @@ def graph_stats(conn):
     }
 
 
-def node_degree(conn, node_id):
-    return conn.execute(
-        "SELECT COUNT(*) FROM edges WHERE subject_id=? OR object_id=?",
+def node_degree(conn, node_id, refuted=frozenset()):
+    """Incident edge count, excluding refuted edges (V18).
+
+    Degree is the denominator of participation_degree_ratio, which decides
+    the pass_through_flag and hence the `discard` label. A relation that was
+    tested and found absent must not change that judgement.
+    """
+    rows = conn.execute(
+        "SELECT id FROM edges WHERE subject_id=? OR object_id=?",
         (node_id, node_id),
-    ).fetchone()[0]
-
-
-def count_well_fed_diseases(conn, disease_ids, k):
-    """Count disease outcomes whose direct in-degree is at least k, via SQL.
-    Agrees with graph_common.count_well_fed_diseases by construction."""
-    marks = ",".join("?" for _ in disease_ids)
-    rows = conn.execute(
-        f"SELECT object_id, COUNT(*) FROM edges "
-        f"WHERE object_id IN ({marks}) GROUP BY object_id",
-        list(disease_ids),
     ).fetchall()
-    indeg = {oid: c for oid, c in rows}
-    return sum(1 for d in disease_ids if indeg.get(d, 0) >= k)
+    return sum(1 for (edge_id,) in rows if edge_id not in refuted)
 
 
-def node_evidence(conn, node_id):
+def contested_incident_nodes(conn, status_by_edge):
+    """Node ids touching at least one contested edge.
+
+    A contested edge carries both asserting and refuting evidence, so any
+    conclusion routed through it is provisional. Used to withhold the
+    `lead` label. This is deliberately the conservative approximation:
+    incidence, not path-crossing. Catching the precise case (a candidate
+    whose favourable path to an outcome crosses a contested edge anywhere
+    upstream) needs the flag threaded through signed_path_net_effect and
+    feedback_control_targets, which is a larger change than the safety gate
+    warrants today. Incidence over-blocks rather than under-blocks, which is
+    the correct direction to err for a public label.
+    """
+    contested = {eid for eid, s in status_by_edge.items() if s == "contested"}
+    if not contested:
+        return set()
+    touched = set()
+    for edge_id, subject_id, object_id in conn.execute(
+        "SELECT id, subject_id, object_id FROM edges"
+    ):
+        if edge_id in contested:
+            touched.add(subject_id)
+            touched.add(object_id)
+    return touched
+
+
+def node_evidence(conn, node_id, refuted=frozenset(), has_assertion=True):
     """Return (evidence_rows, distinct_sources, top_source_share) over the
-    node's incident-edge evidence and its own observations."""
+    node's incident-edge evidence and its own observations.
+
+    V18 exclusions, both of which matter because distinct_sources gates
+    promotion to `lead` through EVIDENCE_DEPTH_FLOOR:
+      - evidence sitting on a refuted edge;
+      - any individually refuting row, wherever it sits.
+    The gate measures how well SUPPORTED a candidate is. A row recording
+    that something was tested and found absent is not support, and must not
+    help clear the bar.
+    """
+    ev_status = "ev.assertion_status" if has_assertion else "'asserting'"
+    obs_status = "assertion_status" if has_assertion else "'asserting'"
     rows = conn.execute(
-        "SELECT COALESCE(NULLIF(ev.source_doi,''),NULLIF(ev.source_pmid,''),"
+        f"SELECT e.id, {ev_status},"
+        "  COALESCE(NULLIF(ev.source_doi,''),NULLIF(ev.source_pmid,''),"
         "  NULLIF(ev.source_filename,'')) AS k"
         " FROM edge_evidence ev JOIN edges e ON ev.edge_id=e.id"
         " WHERE e.subject_id=? OR e.object_id=?"
         " UNION ALL"
-        " SELECT COALESCE(NULLIF(source_doi,''),NULLIF(source_pmid,''),"
+        f" SELECT NULL, {obs_status},"
+        "  COALESCE(NULLIF(source_doi,''),NULLIF(source_pmid,''),"
         "  NULLIF(source_filename,'')) FROM node_observations WHERE node_id=?",
         (node_id, node_id, node_id),
     ).fetchall()
-    total = len(rows)
+    total = 0
     counts = {}
-    for (k,) in rows:
+    for edge_id, status, k in rows:
+        if edge_id is not None and edge_id in refuted:
+            continue
+        if status == "refuting":
+            continue
+        total += 1
         if k:
             counts[k] = counts.get(k, 0) + 1
     distinct = len(counts)
@@ -336,6 +376,12 @@ def classify(cand, breadth_floor):
     # Remaining candidates are central with a coherent favorable action.
     if cand["aging_favorable"] != "yes":
         return "watch_item"
+    # V18: a candidate touching a contested edge (one carrying both
+    # asserting and refuting evidence) is capped at watch_item. The
+    # underlying relation is unsettled, so the claim is not lead-grade
+    # however well the rest of the metrics read.
+    if cand.get("contested_incident_flag"):
+        return "watch_item"
     gates_ok = (cand["distinct_sources"] >= EVIDENCE_DEPTH_FLOOR
                 and not cand["single_source_dominant_flag"])
     if (cand["disease_breadth"] >= breadth_floor
@@ -412,8 +458,20 @@ def main():
     conn = open_db()
     try:
         gstats = graph_stats(conn)
-        well_fed = count_well_fed_diseases(conn, DISEASE_OUTCOME_IDS,
-                                           WELL_FED_INDEGREE_K)
+
+        # V18 assertion polarity. Derived once and threaded through every
+        # grounding metric below, because each of them feeds a gate:
+        # degree -> pass_through_flag -> discard; distinct_sources ->
+        # EVIDENCE_DEPTH_FLOOR -> lead; disease in-degree -> breadth floor
+        # -> lead. A refuted relation must not move any of them.
+        status_by_edge, assertion_census = edge_assertion_status(conn)
+        refuted = {eid for eid, s in status_by_edge.items() if s == "refuted"}
+        has_assertion = assertion_census["column_present"]
+        contested_nodes = contested_incident_nodes(conn, status_by_edge)
+
+        well_fed = count_well_fed_diseases_from_db(
+            conn, DISEASE_OUTCOME_IDS, WELL_FED_INDEGREE_K,
+        )
         breadth_floor = breadth_floor_for(well_fed)
 
         ext_pubmed_ok = False
@@ -433,8 +491,10 @@ def main():
             participation = int(r["pos_participation"])
             pct = float(r["pos_participation_pct"])
 
-            degree = node_degree(conn, nid)
-            ev_rows, distinct_sources, top_share = node_evidence(conn, nid)
+            degree = node_degree(conn, nid, refuted)
+            ev_rows, distinct_sources, top_share = node_evidence(
+                conn, nid, refuted=refuted, has_assertion=has_assertion,
+            )
             ratio = (participation / degree) if degree else float("inf")
 
             pmid_count = None
@@ -481,6 +541,7 @@ def main():
                 "participation_degree_ratio": (round(ratio, 2)
                                                if degree else None),
                 "pass_through_flag": bool(degree and ratio >= PASS_THROUGH_RATIO),
+                "contested_incident_flag": nid in contested_nodes,
                 "evidence_rows": ev_rows,
                 "distinct_sources": distinct_sources,
                 "top_source_share": top_share,
@@ -531,6 +592,7 @@ def main():
         "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
         "db_path": str(DB_PATH),
         "graph": gstats,
+        "assertions": assertion_census,
         "structure": frame,
         "outcomes": outcomes_block,
         "reference_term": REFERENCE_TERM,
@@ -561,6 +623,13 @@ def main():
           + "   ".join(f"{k}: {v}" for k, v in sorted(labels.items())))
     print(f"external: pubmed {report['external_status']['pubmed']}, "
           f"open_targets {report['external_status']['open_targets']}")
+    if not assertion_census["column_present"]:
+        print("NOTE: pre-V18 database; every edge treated as asserted.")
+    elif assertion_census["refuted"] or assertion_census["contested"]:
+        print(f"assertions: {assertion_census['refuted']} refuted edge(s) "
+              f"excluded from all grounding metrics, "
+              f"{assertion_census['contested']} contested edge(s) capped at "
+              f"watch_item")
     if frame["truncation_suspected"]:
         print(f"NOTE: {frame['loops_at_cap']} of {frame['loops_total']} loops "
               f"are at the length cap {CYCLE_LENGTH_CAP}; counts are truncation-"

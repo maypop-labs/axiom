@@ -6,7 +6,7 @@
 
 
 
-Standard procedure for reviewing the support for a single curated edge against the current corpus. Re-resolves each evidence chunk, validates conditions, cross-checks cell_system, identifies missing observations and identity gaps on endpoint nodes, and surfaces additional supporting or contradicting chunks in the broader corpus. Output is an audit report ending in a GRAPH PROPOSAL for the additive changes (evidence, conditions, observations, aliases, cross_references) that the current MCP supports, plus a separate Manual-handling section for subtractive changes that require AXIOM Developer.
+Standard procedure for reviewing the support for a single curated edge against the current corpus. Re-resolves each evidence chunk, validates conditions, cross-checks cell_system, identifies missing observations and identity gaps on endpoint nodes, and surfaces additional supporting or contradicting chunks in the broader corpus. Output is an audit report ending in a GRAPH PROPOSAL covering additive changes (evidence, conditions, observations, aliases, cross_references), corrective ones (edge re-typing or subject reassignment via graph_update_edge, removals via the graph_delete_* tools), and refutations (V18: marking an evidence row `refuting` where the relation was tested and found absent, rather than deleting an edge that recorded a real negative result), plus a Manual-handling section for issues that live in code rather than in the graph.
 
 
 
@@ -108,7 +108,7 @@ Distinguish conditions (when the edge holds) from cell_system (where it was demo
 
 
 
-Unsupported conditions are removal candidates and go to the Manual-handling section (see deferred-tools note).
+Unsupported conditions are removal candidates. Drop them with graph_delete_condition, or, when the call is a judgment one, surface them in the proposal for the user to decide.
 
 
 
@@ -166,25 +166,36 @@ Section order in the response:
 
 6. **Contradictions in corpus.** Chunks that conflict with the edge as recorded, with citations and one-line descriptions.
 
-7. **GRAPH PROPOSAL.** Additive changes only: new evidence, new conditions, new observations, new aliases, new cross_references. Per the format in the project's custom instructions.
+7. **GRAPH PROPOSAL.** Additive items (new evidence, conditions, observations, aliases, cross_references), corrective items (edge_updates for re-typing or subject reassignment; deletions for evidence, conditions, or observations that no longer hold; graph_delete_edge when the whole edge is unsound), and **refutations** (evidence rows with `assertion_status: "refuting"` where the relation was tested and found absent). Per the format in the project's custom instructions. Flag any delete_edge explicitly, because of the cascade to its conditions and evidence. Where the audit could plausibly go either way between deleting an edge and refuting it, say which you chose and why; see the Tooling note.
 
-8. **Manual-handling items.** Subtractive corrections (evidence rows that no longer hold, conditions to drop) listed with chunk_ids or condition tuples and one-line reasons; user resolves via AXIOM Developer until deletion MCP tools land.
-
-
-
-## Deferred-tools note
+8. **Manual-handling items.** Issues the MCP cannot fix because they live in code rather than in the graph: EDGE_SIGN sign-map changes, outcome-panel (DISEASE_OUTCOME_IDS / HALLMARK_OUTCOME_IDS) membership, node merges, and schema questions. One line each. Subtractive graph corrections are NOT manual-handling items; commit them with the deletion tools.
 
 
 
-The current AXIOM MCP has `graph_delete_edge` and `graph_delete_node` (both cascading), but lacks `graph_delete_evidence`, `graph_delete_condition`, and `graph_delete_observation`. The DB methods exist; the MCP wrapping is in the Pending/Deferred backlog.
+## Tooling note
 
 
 
-This SOP proposes additive corrections via existing MCP tools. Subtractive corrections live in the Manual-handling section until those tools land.
+The AXIOM MCP exposes the full deletion set, and all of it is callable: `graph_delete_node` and `graph_delete_edge` (both cascading), plus `graph_delete_evidence`, `graph_delete_condition`, `graph_delete_alias`, and `graph_delete_observation`. Earlier revisions of this SOP claimed the last three were unwrapped. That is stale and was corrected on 2026-07-12.
 
 
 
-If the audit determines the entire edge is unsound (most or all evidence in the "does not hold" category, no salvageable interpretation, no confirming evidence in broader corpus), the appropriate action is `graph_delete_edge`. Include this as a GRAPH PROPOSAL item but flag it explicitly because of the cascade to conditions and evidence.
+Correction in place is usually better than delete-and-recreate. `graph_update_edge` takes subject_id, object_id, edge_type, and notes, so a mis-typed or misattributed edge can be repaired without cascading its evidence and conditions away. `graph_apply_proposal` carries this in its `edge_updates` section alongside `evidence_additions`, `observation_rewrites`, `cross_reference_updates`, and `node_updates`, so an audit's entire remedy, additive and corrective together, commits atomically in one call and returns `previous_values_for_in_place_edits` as the rollback record.
+
+
+
+Worked precedent (2026-07-12): five edges from the salutary-named hallmarks (proteostasis, macroautophagy) into disease outcomes had been typed `contributes_to`, whose EDGE_SIGN is +1, thereby asserting that MORE proteostasis causes MORE Alzheimer's disease. Each edge's own evidence justification recorded the intended claim as loss-of-function. The whole remedy (re-type all five to `suppresses`, add corpus evidence, add polarity-anchor observations to both endpoint hallmarks) went through one `graph_apply_proposal` call with no deletions and no loss of coverage.
+
+
+
+If the audit determines the entire edge is unsound, there are now **two** distinct terminal outcomes, and choosing between them is the single most consequential judgement in an audit. Do not reach for deletion by default.
+
+- **Delete (`graph_delete_edge`)** when the edge should never have existed: it was a curation error, a misreading of a chunk, a marker mistaken for a driver with no repairable subject, or a duplicate. Nothing was learned about the biology. Deleting loses nothing because there was nothing there. Flag it explicitly in the proposal because of the cascade to conditions and evidence.
+- **Refute (`assertion_status: "refuting"`, V18)** when the relation was genuinely tested and found absent. The edge stays; a refuting evidence row is added carrying the `method` that returned null. An edge whose evidence is entirely refuting derives as `refuted` and is excluded from all five analysis passes and from every grounding metric in the build report, so it stops influencing results without being erased. This is strictly better than deletion here: the graph retains the fact that the question was asked and answered, which is exactly what stops the same edge being re-proposed from the same paper six months later.
+
+The discriminator is simple. Ask whether the corpus says "this was tested and did not hold" or "we never had grounds to claim this". The first is a refutation and is knowledge. The second is a mistake and is deletable. When an audit surfaces contradicting chunks in Step 6, that is usually evidence for the first, not the second.
+
+An edge that ends the audit with both asserting and refuting evidence derives as `contested`. That is a legitimate resting state, not an unresolved audit: it means the relation holds under some conditions and not others, and the analysis layer handles it by traversing the edge while capping any candidate touching it at `watch_item`. Record both sides and say so in the report rather than forcing a verdict.
 
 
 
@@ -222,7 +233,7 @@ One pass through evidence (Step 2), one pass through conditions (Step 3), one pa
 
 - Node-centric reviews (use a connections dossier instead).
 
-- Subtractive MCP writes (deferred).
+- Code-level fixes (EDGE_SIGN, outcome-panel membership, node merges). Flag them in Manual-handling; they belong to AXIOM Developer.
 
 - Piecemeal graph writes during the audit. The commit happens once at SOP completion via graph_apply_proposal per the custom-instructions conversation protocol.
 
